@@ -1085,7 +1085,9 @@ def _build_semi_annual_sequences(fin_records_by_period, n_total, nl):
     ]
     D = len(INDICATOR_ORDER)  # 12
 
+    # ── 第一遍：收集所有上市公司的原始值 + 初步构建（不含标准化） ──
     x_seq = np.zeros((n_total, 4, D + 1), dtype=np.float32)  # 最后一维 = has_feature
+    all_raw_vals = {d_idx: [] for d_idx in range(D)}  # 用于后续按指标标准化
 
     listed_with_data = 0
     total_periods_collected = 0
@@ -1103,25 +1105,24 @@ def _build_semi_annual_sequences(fin_records_by_period, n_total, nl):
 
         # 构建 (num_periods, D) 矩阵
         num_p = len(recent_periods)
-        feats = np.full((num_p, D), np.nan, dtype=np.float32)
+        feats_raw = np.full((num_p, D), np.nan, dtype=np.float32)
         for p_idx, accper in enumerate(recent_periods):
             rec = periods_dict[accper]
             for d_idx, ind in enumerate(INDICATOR_ORDER):
                 v = rec.get(ind, np.nan)
                 if not np.isnan(v):
-                    feats[p_idx, d_idx] = v
+                    feats_raw[p_idx, d_idx] = v
+                    all_raw_vals[d_idx].append(v)
 
         # ── 缺失值处理 ──
-        valid_mask = ~np.isnan(feats)  # (num_p, D)
-        n_valid_periods = np.sum(valid_mask.any(axis=1))  # 至少有一个指标真实的期数
+        valid_mask = ~np.isnan(feats_raw)  # (num_p, D)
+        n_valid_periods = np.sum(valid_mask.any(axis=1))
 
         if n_valid_periods >= 3:
-            # 线性插值（按列）
             for d_idx in range(D):
-                col = feats[:, d_idx].copy()
+                col = feats_raw[:, d_idx].copy()
                 valid_idx = np.where(~np.isnan(col))[0]
                 if len(valid_idx) >= 2:
-                    # numpy 线性插值
                     xp = valid_idx.astype(np.float64)
                     fp = col[valid_idx]
                     all_idx = np.arange(num_p, dtype=np.float64)
@@ -1130,32 +1131,47 @@ def _build_semi_annual_sequences(fin_records_by_period, n_total, nl):
                     col = np.full(num_p, col[valid_idx[0]])
                 else:
                     col = np.zeros(num_p)
-                feats[:, d_idx] = col
+                feats_raw[:, d_idx] = col
         elif n_valid_periods >= 2:
-            # 公司自身中位数填充
-            col_medians = np.nanmedian(feats, axis=0)
+            col_medians = np.nanmedian(feats_raw, axis=0)
             col_medians = np.where(np.isnan(col_medians), 0.0, col_medians)
             for d_idx in range(D):
-                col = feats[:, d_idx].copy()
+                col = feats_raw[:, d_idx].copy()
                 col[np.isnan(col)] = col_medians[d_idx]
-                feats[:, d_idx] = col
+                feats_raw[:, d_idx] = col
         else:
-            # <2 期有效 — 全零，has_feature 保持 0
-            feats = np.zeros((num_p, D), dtype=np.float32)
+            feats_raw = np.zeros((num_p, D), dtype=np.float32)
 
-        # 填入 x_seq（靠右对齐：最近一期在位置 3）
+        # 暂存（先不填 has_feature，标准化后再填）
         start_col = 4 - num_p
         for p_idx in range(num_p):
             seq_pos = start_col + p_idx
-            x_seq[eid, seq_pos, :D] = feats[p_idx]
+            x_seq[eid, seq_pos, :D] = feats_raw[p_idx]
 
-            # has_feature: 该期是否有 ≥50% 指标真实（非 NaN 且非零填充）
-            n_real = (~np.isnan(feats[p_idx]) & (feats[p_idx] != 0)).sum()
-            if n_real >= D * 0.5:
-                x_seq[eid, seq_pos, D] = 1.0
+    # ── 标准化：按指标计算均值/标准差（只用有数据的上市公司），做 Z-score ──
+    indicator_mean = np.zeros(D, dtype=np.float32)
+    indicator_std = np.ones(D, dtype=np.float32)   # 防止除零
+    for d_idx in range(D):
+        vals = all_raw_vals[d_idx]
+        if len(vals) >= 30:
+            indicator_mean[d_idx] = np.mean(vals)
+            indicator_std[d_idx] = np.std(vals) + 1e-8
+
+    # 对所有上市公司 + 非上市公司统一做标准化
+    for eid in range(nl):
+        for q in range(4):
+            if x_seq[eid, q, :D].sum() != 0:  # 有数据的期才标准化
+                x_seq[eid, q, :D] = (x_seq[eid, q, :D] - indicator_mean) / indicator_std
+                # has_feature: 该期是否有 ≥50% 指标非零（标准化后非零 = 原始有值）
+                n_real = (np.abs(x_seq[eid, q, :D]) > 1e-6).sum()
+                if n_real >= D * 0.5:
+                    x_seq[eid, q, D] = 1.0
 
     print(f"  时序序列: {listed_with_data}/{nl} 上市公司有时序数据, "
           f"平均 {total_periods_collected / max(listed_with_data, 1):.1f} 期/企")
+    if listed_with_data > 0:
+        print(f"  标准化: 均值范围 [{indicator_mean.min():.3f}, {indicator_mean.max():.3f}], "
+              f"标准差范围 [{indicator_std.min():.3f}, {indicator_std.max():.3f}]")
 
     return x_seq
 
