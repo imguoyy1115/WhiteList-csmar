@@ -182,8 +182,9 @@ def compute_losses(logit_white, logit_risk, logit_grade,
     )
     L_grade = F.cross_entropy(logit_grade[mask], y_grade[mask])
 
-    # Γ 正则化
-    L_gamma_reg = ((gamma - torch.eye(gamma.shape[0], device=gamma.device)) ** 2).mean()
+    # Γ 正则化：最大化每行熵 → 鼓励跨关系探索，不自锁在对角
+    entropy_per_row = -(gamma * torch.log(gamma + 1e-8)).sum(dim=-1)
+    L_gamma_reg = -entropy_per_row.mean()
 
     # 超图结构一致性（采样评估，不全量遍历防 OOM）
     L_struct = torch.tensor(0.0, device=logit_white.device)

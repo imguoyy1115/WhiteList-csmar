@@ -35,7 +35,7 @@ HYPER_AGGR = "attention"   # 超边内聚合方式: mean / attention
 NUM_FIN_STATES = 18        # 财务状态节点数（6指标 × 3档）
 NUM_LAWSUIT_TYPES = 8      # 诉讼类型节点数
 NUM_SCF_TYPES = 6          # SCF合约类型节点数
-HETERO_LAYERS = 2          # 异构图卷积层数（1→2 捕获二阶邻居信号）
+HETERO_LAYERS = 1          # 异构图卷积层数（特征查找节点 1 层足够，2 层过拟合）
 
 # ── Γ 矩阵 ──
 # 关系类型: trade, equity, has_financial, has_lawsuit, uses_scf, legal_rep
@@ -78,7 +78,7 @@ BATCH_SIZE = 512
 # ── 损失权重 ──
 LAMBDA_RISK = 0.5
 LAMBDA_GRADE = 0.3
-LAMBDA_GAMMA_REG = 0.01
+LAMBDA_GAMMA_REG = 0.001    # 熵正则（鼓励跨关系探索，力度轻）
 LAMBDA_STRUCT = 0.05       # 新增：超图结构一致性正则（同超边内预测平滑）
 LAMBDA_SPARSE = 0.01       # 新增：Γ 非对角线稀疏正则
 
