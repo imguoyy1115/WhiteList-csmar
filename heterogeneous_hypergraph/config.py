@@ -82,8 +82,9 @@ LAMBDA_GAMMA_REG = 0.001    # 熵正则（鼓励跨关系探索，力度轻）
 LAMBDA_STRUCT = 0.05       # 新增：超图结构一致性正则（同超边内预测平滑）
 LAMBDA_SPARSE = 0.01       # 新增：Γ 非对角线稀疏正则
 
-# ── 消融实验 ──
-ABLATION_NO_GAMMA = False  # True = Γ 退化为单位矩阵（消融：测试跨关系传播的贡献）
+# ── 消融实验（默认全部关闭 = 完整模型） ──
+ABLATION_NO_GAMMA = False     # True = Γ 退化为 I（消融跨关系传播）
+ABLATION_NO_TEMPORAL = False  # True = 去掉 GRU 时序，退化为 MLP 投影
 
 # ============================================================================
 # 边类型定义（v5 扩展为 6 种）

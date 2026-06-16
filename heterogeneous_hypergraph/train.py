@@ -23,10 +23,9 @@ import gc
 from config import (
     DEVICE, EPOCHS, LR, LR_HYPER, WEIGHT_DECAY, EARLY_STOP_PATIENCE, SEED,
     LAMBDA_RISK, LAMBDA_GRADE, LAMBDA_GAMMA_REG, LAMBDA_STRUCT,
-    HIDDEN_DIM, HYPER_HIDDEN, FUSION_HIDDEN, USE_AMP,
+    HIDDEN_DIM, HYPER_HIDDEN, FUSION_HIDDEN, USE_AMP, DROPOUT,
 )
 import config as _cfg  # 运行时读取 ABLATION_NO_GAMMA，避免 import 缓存
-)
 from hypergraph.hypergraph_conv import MultiViewHyperEncoder
 from heterogeneous.hetero_encoder import HeteroChannelEncoder
 from fusion.fusion_gate import FusionGate
@@ -96,12 +95,21 @@ class HyperHeteroModel(nn.Module):
         self.gamma_module = CrossRelationPropagation(
             edge_names=edge_names, ablation=_cfg.ABLATION_NO_GAMMA)
 
-        # ── 时序编码器（lazy init） ──
-        self.temporal = TemporalEncoder(input_dim=None)
+        # ── 时序编码器 / 消融：MLP 投影 ──
+        self.fusion_dim = FUSION_HIDDEN + HIDDEN_DIM  # h_fusion(64) + h_risk(128) = 192
+        if _cfg.ABLATION_NO_TEMPORAL:
+            # 消融：用简单 MLP 替代 GRU 时序编码
+            self.temporal = nn.Sequential(
+                nn.Linear(self.fusion_dim, 64),
+                nn.ReLU(),
+                nn.Dropout(DROPOUT),
+                nn.Linear(64, 64),
+            )
+        else:
+            self.temporal = TemporalEncoder(input_dim=None)
 
         # ── 预测头 ──
-        self.fusion_dim = FUSION_HIDDEN + HIDDEN_DIM  # h_fusion(64) + h_risk(128) = 192
-        self.heads = MultiTaskHeads(in_dim=self.temporal.hidden)
+        self.heads = MultiTaskHeads(in_dim=64)  # 两种路径都输出 64 维
 
         # ── per-relation 消息提取器 ──
         self.msg_extractors = nn.ModuleDict()
@@ -157,8 +165,11 @@ class HyperHeteroModel(nn.Module):
         # ── 6. 融合 → 时序 ──
         h_combined = torch.cat([h_fusion, h_risk], dim=-1)  # (N_ent, 192)
 
-        # ── 7. 时序编码 ──
-        z_v = self.temporal(h_combined, x_seq=x_seq)  # (N_ent, 64)
+        # ── 7. 时序编码 / 消融：MLP 投影 ──
+        if _cfg.ABLATION_NO_TEMPORAL:
+            z_v = self.temporal(h_combined)            # MLP: (N_ent, 192) → (N_ent, 64)
+        else:
+            z_v = self.temporal(h_combined, x_seq=x_seq)  # GRU: (N_ent, 192) + x_seq → (N_ent, 64)
 
         # ── 8. 预测头 ──
         logit_white, logit_risk, logit_grade = self.heads(z_v)

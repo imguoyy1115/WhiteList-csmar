@@ -74,7 +74,7 @@ class TemporalEncoder(nn.Module):
             hidden_size=self.gru_hidden, # 32
             num_layers=2,
             batch_first=True,
-            dropout=DROPOUT if 2 > 1 else 0.0,
+            dropout=DROPOUT if num_layers > 1 else 0.0,
         ).to(device)
         self.gru_proj = nn.Linear(self.gru_hidden, self.hidden).to(device)
 
@@ -119,7 +119,7 @@ class TemporalEncoder(nn.Module):
             gru_z = self.gru_proj(gru_last)           # (N, hidden)
 
             # Temporal Gate
-            has_any = x_seq[:, 0, -1:]                # (N, 1)  has_feature_q of Q1
+            has_any = x_seq[:, :, -1:].max(dim=1, keepdim=True).values  # (N, 1)  任一季有真实特征
             gate_in = torch.cat([h_fusion, has_any], dim=-1)  # (N, fusion_dim+1)
             trust = self.gate_net(gate_in)            # (N, 1)  per-node gate
 
