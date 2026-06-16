@@ -35,7 +35,7 @@ HYPER_AGGR = "attention"   # 超边内聚合方式: mean / attention
 NUM_FIN_STATES = 18        # 财务状态节点数（6指标 × 3档）
 NUM_LAWSUIT_TYPES = 8      # 诉讼类型节点数
 NUM_SCF_TYPES = 6          # SCF合约类型节点数
-HETERO_LAYERS = 1          # 异构图卷积层数（1 层省 ~50% 显存，2 层=更多消息融合）
+HETERO_LAYERS = 2          # 异构图卷积层数（1→2 捕获二阶邻居信号）
 
 # ── Γ 矩阵 ──
 # 关系类型: trade, equity, has_financial, has_lawsuit, uses_scf, legal_rep
@@ -60,7 +60,7 @@ HEAD_BATCH_SIZE = 4096
 # ============================================================================
 SEED = 42
 DEVICE = "cuda"
-EPOCHS = 300
+EPOCHS = 500
 LR = 1e-3
 LR_HYPER = 3e-4            # 超图通道学习率（单独设置，更保守）
 WEIGHT_DECAY = 5e-4

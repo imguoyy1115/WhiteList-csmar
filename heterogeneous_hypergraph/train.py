@@ -254,7 +254,7 @@ def train(model, data, epochs: int = EPOCHS):
     print(f"  设备: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(device)}")
-        print(f"  显存总量: {torch.cuda.get_device_properties(device).total_mem / 1024**3:.1f} GB")
+        print(f"  显存总量: {torch.cuda.get_device_properties(device).total_memory / 1024**3:.1f} GB")
 
     model = model.to(device)
     data = data.to(device)
