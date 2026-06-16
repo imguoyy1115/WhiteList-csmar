@@ -92,8 +92,14 @@ class HyperHeteroModel(nn.Module):
 
         # ── Γ 矩阵 ──
         edge_names = list(set(et[1] for et in edge_types))
+        # 仅企业→企业的同构边参与跨关系风险传播，特征查找边不混入
+        risk_edge_names = [et[1] for et in edge_types
+                           if et[0] == "enterprise" and et[2] == "enterprise"]
+        risk_edge_names = list(set(risk_edge_names))  # trade, equity, legal_rep
         self.gamma_module = CrossRelationPropagation(
-            edge_names=edge_names, ablation=_cfg.ABLATION_NO_GAMMA)
+            edge_names=edge_names,
+            risk_edge_names=risk_edge_names,
+            ablation=_cfg.ABLATION_NO_GAMMA)
 
         # ── 时序编码器 / 消融：MLP 投影 ──
         self.fusion_dim = FUSION_HIDDEN + HIDDEN_DIM  # h_fusion(64) + h_risk(128) = 192
