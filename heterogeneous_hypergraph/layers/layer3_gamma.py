@@ -45,6 +45,7 @@ class CrossRelationPropagation(nn.Module):
             edge_names = EDGE_TYPE_NAMES
         self.edge_names = edge_names
         self.R = len(edge_names)                    # 全部边类型数（6）
+        self.hidden = hidden
 
         # ── 风险边：参与 Γ 混合的同构边（3） ──
         if risk_edge_names is None:
