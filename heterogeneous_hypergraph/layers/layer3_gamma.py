@@ -27,13 +27,14 @@ class CrossRelationPropagation(nn.Module):
     ==========================================================================
     """
     def __init__(self, edge_names: list = None, hidden: int = HIDDEN_DIM,
-                 gamma_init: str = "identity"):
+                 gamma_init: str = "identity", ablation: bool = False):
         super().__init__()
         if edge_names is None:
             edge_names = EDGE_TYPE_NAMES  # fallback
         self.edge_names = edge_names
         self.R = len(edge_names)
         self.hidden = hidden
+        self.ablation = ablation  # 消融模式：Γ 退化为单位矩阵
 
         # ---- Γ 矩阵：关系迁移强度 ----
         raw_gamma = torch.randn(self.R, self.R)
@@ -50,7 +51,9 @@ class CrossRelationPropagation(nn.Module):
         self.semantic_attn = nn.Linear(hidden, 1)
 
     def get_gamma(self) -> torch.Tensor:
-        """获取归一化后的 Γ 矩阵"""
+        """获取归一化后的 Γ 矩阵（消融模式下退化为单位矩阵）"""
+        if self.ablation:
+            return torch.eye(self.R, device=self.gamma_raw.device)
         return F.softmax(self.gamma_raw, dim=-1)
 
     def forward(self, m_v_r: dict, edge_index_dict: dict,

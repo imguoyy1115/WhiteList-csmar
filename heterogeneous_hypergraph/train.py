@@ -25,6 +25,8 @@ from config import (
     LAMBDA_RISK, LAMBDA_GRADE, LAMBDA_GAMMA_REG, LAMBDA_STRUCT,
     HIDDEN_DIM, HYPER_HIDDEN, FUSION_HIDDEN, USE_AMP,
 )
+import config as _cfg  # 运行时读取 ABLATION_NO_GAMMA，避免 import 缓存
+)
 from hypergraph.hypergraph_conv import MultiViewHyperEncoder
 from heterogeneous.hetero_encoder import HeteroChannelEncoder
 from fusion.fusion_gate import FusionGate
@@ -91,7 +93,8 @@ class HyperHeteroModel(nn.Module):
 
         # ── Γ 矩阵 ──
         edge_names = list(set(et[1] for et in edge_types))
-        self.gamma_module = CrossRelationPropagation(edge_names=edge_names)
+        self.gamma_module = CrossRelationPropagation(
+            edge_names=edge_names, ablation=_cfg.ABLATION_NO_GAMMA)
 
         # ── 时序编码器（lazy init） ──
         self.temporal = TemporalEncoder(input_dim=None)
