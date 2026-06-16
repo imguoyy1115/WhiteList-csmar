@@ -45,6 +45,7 @@ class TemporalEncoder(nn.Module):
         super().__init__()
         self.hidden = hidden
         self.gru_hidden = gru_hidden
+        self.num_layers = num_layers
         self.input_dim = input_dim
 
         # ---- Lazy init: 首次 forward 时按实际维度构建 ----
@@ -74,7 +75,7 @@ class TemporalEncoder(nn.Module):
             hidden_size=self.gru_hidden, # 32
             num_layers=2,
             batch_first=True,
-            dropout=DROPOUT if num_layers > 1 else 0.0,
+            dropout=DROPOUT if self.num_layers > 1 else 0.0,
         ).to(device)
         self.gru_proj = nn.Linear(self.gru_hidden, self.hidden).to(device)
 
