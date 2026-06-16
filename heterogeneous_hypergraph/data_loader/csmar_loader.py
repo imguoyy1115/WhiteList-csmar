@@ -273,18 +273,38 @@ def build_features_v5(T, E):
         "risklevel": {"F070101B": "DFL", "F070201B": "DOL"},
     }
 
-    financial_records = defaultdict(dict)  # {eid: {"CR": value, "DAR": value, ...}}
+    financial_records = defaultdict(dict)  # {eid: {"CR": value, ...}}  最新一期（用于 FinancialState 节点）
+    fin_records_by_period = defaultdict(lambda: defaultdict(dict))  # {eid: {accper: {"CR": value, ...}}}
 
     for tab_key, fmap in fin_map.items():
         df = T[tab_key].copy()
         df["code"] = df["Stkcd"].astype(str).apply(_stock)
         if "Typrep" in df.columns:
             df = df[df["Typrep"].astype(str).str.upper() == "B"]  # 半年报
-        df = df.sort_values("Accper").groupby("code").last().reset_index()
-        eid_arr = df["code"].apply(lambda c: ent_id(c, E)).values
+        df = df.sort_values("Accper")
+
+        for code, group in df.groupby("code"):
+            eid = ent_id(code, E)
+            if eid < 0 or eid >= nl:
+                continue
+            eid = int(eid)
+            # 取最后 4 期
+            recent = group.tail(4)
+            for _, row in recent.iterrows():
+                accper = str(row["Accper"])
+                for fcol, short_name in fmap.items():
+                    v = pd.to_numeric(row[fcol], errors="coerce")
+                    if pd.notna(v):
+                        fin_records_by_period[eid][accper][short_name] = float(np.clip(v, -10, 100))
+                    else:
+                        fin_records_by_period[eid][accper][short_name] = np.nan
+
+        # 最新一期用于 FinancialState 节点
+        df_last = df.groupby("code").last().reset_index()
+        eid_arr = df_last["code"].apply(lambda c: ent_id(c, E)).values
         for fcol, short_name in fmap.items():
-            v = pd.to_numeric(df[fcol], errors="coerce").fillna(0).clip(-10, 100).values
-            for i in range(len(df)):
+            v = pd.to_numeric(df_last[fcol], errors="coerce").fillna(0).clip(-10, 100).values
+            for i in range(len(df_last)):
                 eid = eid_arr[i]
                 if 0 <= eid < nl:
                     financial_records[int(eid)][short_name] = float(v[i])
@@ -392,7 +412,7 @@ def build_features_v5(T, E):
     print(f"  Enterprise feature dim: {DIM_ENT}, coverage: {mask_real.sum()}/{nl}"
           f" (ST: {len(st_ids & set(range(nl)))})")
 
-    return X_ent, M_ent, fin_nodes, scaler
+    return X_ent, M_ent, fin_nodes, scaler, fin_records_by_period
 
 
 def _build_financial_state_nodes(financial_records, nl):
@@ -755,7 +775,7 @@ def build_hyperedges(E, edge_index_dict, nl):
 # ═══════════════════════════════════════════════════════════
 # Step 5: 标签 + 组装
 # ═══════════════════════════════════════════════════════════
-def build_labels_and_assemble_v5(T, E, X_ent, M_ent, fin_nodes, ei, hyperedges):
+def build_labels_and_assemble_v5(T, E, X_ent, M_ent, fin_nodes, ei, hyperedges, fin_records_by_period=None):
     print("\n[5/5] Labels + assembly (v5)...")
     n, nl = E["n_total"], E["n_listed"]
 
@@ -832,7 +852,7 @@ def build_labels_and_assemble_v5(T, E, X_ent, M_ent, fin_nodes, ei, hyperedges):
     struct_hint_dict = {"enterprise": torch.tensor(struct_hint)}
 
     # ── 时序快照（4 个半年） ──
-    x_seq = _build_semi_annual_sequences(X_ent, T, E, nl)
+    x_seq = _build_semi_annual_sequences(fin_records_by_period, n, nl)
 
     # ── 分层随机切分 ──
     from sklearn.model_selection import train_test_split
@@ -1035,21 +1055,108 @@ def _compute_structural_features_v5(X, ei, n, nl):
     return X_struct.astype(np.float32), struct_hint.astype(np.float32)
 
 
-def _build_semi_annual_sequences(X_ent, T, E, nl):
+def _build_semi_annual_sequences(fin_records_by_period, n_total, nl):
     """
     ==========================================================================
-    构建 4 步半年报时序特征（替代 v4 的 Q4 重复 x_seq）。
+    构建 4 步半年报时序特征（真实多期数据版）。
 
-    当前简化版：取最近 4 个半年的特征快照。
-    由于目前半年报时序数据还未完全整理（需要按 Accper 分半年构建特征），
-    暂用最近 4 个半年的 Q4 重复 + 差异标记。
+    从 fin_records_by_period（多期财务指标）中每家企业取最后 4 个
+    报告期，构建 (N, 4, 12+1) 序列：
+      - 12 维财务指标（CR, DAR, ICR, ROA, ROE, ART, APT, TAGR, REVGR,
+                          CFONI, DFL, DOL）
+      - 1  维 has_feature 标记（该期是否有 ≥50% 指标真实存在）
 
-    TODO: 按 Accper 的真实半年切分，每个半年独立构建快照。
+    缺失值处理：
+      - ≥3 期有效 → 线性插值
+      - 2 期有效 → 公司自身中位数填充
+      - <2 期有效 → 全零 + has_feature=0（TemporalGate 走 MLP fallback）
+
+    非上市企业（eid >= nl）：全零序列，TemporalGate 自动走 MLP。
     ==========================================================================
     """
-    x_seq = np.zeros((E["n_total"], 4, 13), dtype=np.float32)
-    for q in range(4):
-        x_seq[:, q, :] = X_ent.copy()
+    # 12 个财务指标（固定顺序）
+    INDICATOR_ORDER = [
+        "CR", "DAR", "ICR",        # 偿债能力
+        "ROA", "ROE",               # 盈利能力
+        "ART", "APT",               # 经营能力
+        "TAGR", "REVGR",            # 发展能力
+        "CFONI",                    # 现金流
+        "DFL", "DOL",               # 风险水平
+    ]
+    D = len(INDICATOR_ORDER)  # 12
+
+    x_seq = np.zeros((n_total, 4, D + 1), dtype=np.float32)  # 最后一维 = has_feature
+
+    listed_with_data = 0
+    total_periods_collected = 0
+
+    for eid in range(nl):
+        periods_dict = fin_records_by_period.get(eid, {})
+        if not periods_dict:
+            continue
+
+        # 按报告期排序，取最后 4 期
+        sorted_periods = sorted(periods_dict.keys())
+        recent_periods = sorted_periods[-4:]
+        total_periods_collected += len(recent_periods)
+        listed_with_data += 1
+
+        # 构建 (num_periods, D) 矩阵
+        num_p = len(recent_periods)
+        feats = np.full((num_p, D), np.nan, dtype=np.float32)
+        for p_idx, accper in enumerate(recent_periods):
+            rec = periods_dict[accper]
+            for d_idx, ind in enumerate(INDICATOR_ORDER):
+                v = rec.get(ind, np.nan)
+                if not np.isnan(v):
+                    feats[p_idx, d_idx] = v
+
+        # ── 缺失值处理 ──
+        valid_mask = ~np.isnan(feats)  # (num_p, D)
+        n_valid_periods = np.sum(valid_mask.any(axis=1))  # 至少有一个指标真实的期数
+
+        if n_valid_periods >= 3:
+            # 线性插值（按列）
+            for d_idx in range(D):
+                col = feats[:, d_idx].copy()
+                valid_idx = np.where(~np.isnan(col))[0]
+                if len(valid_idx) >= 2:
+                    # numpy 线性插值
+                    xp = valid_idx.astype(np.float64)
+                    fp = col[valid_idx]
+                    all_idx = np.arange(num_p, dtype=np.float64)
+                    col = np.interp(all_idx, xp, fp)
+                elif len(valid_idx) == 1:
+                    col = np.full(num_p, col[valid_idx[0]])
+                else:
+                    col = np.zeros(num_p)
+                feats[:, d_idx] = col
+        elif n_valid_periods >= 2:
+            # 公司自身中位数填充
+            col_medians = np.nanmedian(feats, axis=0)
+            col_medians = np.where(np.isnan(col_medians), 0.0, col_medians)
+            for d_idx in range(D):
+                col = feats[:, d_idx].copy()
+                col[np.isnan(col)] = col_medians[d_idx]
+                feats[:, d_idx] = col
+        else:
+            # <2 期有效 — 全零，has_feature 保持 0
+            feats = np.zeros((num_p, D), dtype=np.float32)
+
+        # 填入 x_seq（靠右对齐：最近一期在位置 3）
+        start_col = 4 - num_p
+        for p_idx in range(num_p):
+            seq_pos = start_col + p_idx
+            x_seq[eid, seq_pos, :D] = feats[p_idx]
+
+            # has_feature: 该期是否有 ≥50% 指标真实（非 NaN 且非零填充）
+            n_real = (~np.isnan(feats[p_idx]) & (feats[p_idx] != 0)).sum()
+            if n_real >= D * 0.5:
+                x_seq[eid, seq_pos, D] = 1.0
+
+    print(f"  时序序列: {listed_with_data}/{nl} 上市公司有时序数据, "
+          f"平均 {total_periods_collected / max(listed_with_data, 1):.1f} 期/企")
+
     return x_seq
 
 
@@ -1066,7 +1173,7 @@ def load_csmar_data_v5():
     E = build_entities(T)
     stages.append(("Entities", time.time() - t0))
     t0 = time.time()
-    X_ent, M_ent, fin_nodes, scaler = build_features_v5(T, E)
+    X_ent, M_ent, fin_nodes, scaler, fin_records_by_period = build_features_v5(T, E)
     stages.append(("Features", time.time() - t0))
     t0 = time.time()
     ei = build_edges_v5(T, E, fin_nodes)
@@ -1075,7 +1182,7 @@ def load_csmar_data_v5():
     hyperedges = build_hyperedges(E, ei, E["n_listed"])
     stages.append(("Hyperedges", time.time() - t0))
     t0 = time.time()
-    data = build_labels_and_assemble_v5(T, E, X_ent, M_ent, fin_nodes, ei, hyperedges)
+    data = build_labels_and_assemble_v5(T, E, X_ent, M_ent, fin_nodes, ei, hyperedges, fin_records_by_period)
     stages.append(("Assembly", time.time() - t0))
     print("\nTiming:")
     for name, sec in stages:
