@@ -44,6 +44,15 @@ from sklearn.metrics import (
 )
 import xgboost as xgb
 
+
+def precision_at_k(y_true, y_score, k: int = 10):
+    """Precision@K: 模型打分最高的 K 个样本中正类的比例"""
+    if len(y_score) == 0:
+        return 0.0
+    k = min(k, len(y_score))
+    top_k_idx = np.argsort(y_score)[-k:]
+    return float(y_true[top_k_idx].sum()) / k
+
 # ============================================================================
 # 全局配置
 # ============================================================================
@@ -208,13 +217,15 @@ def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_name
     test_precision = precision_score(y_test, y_pred, zero_division=0)
     test_recall = recall_score(y_test, y_pred, zero_division=0)
     test_f1 = f1_score(y_test, y_pred, zero_division=0)
+    test_prec10 = precision_at_k(y_test, y_pred_proba, k=10)
 
     print(f"  ── 测试集 ──")
-    print(f"  AUC:       {test_auc:.4f}")
-    print(f"  Accuracy:  {test_acc:.4f}")
-    print(f"  Precision: {test_precision:.4f}")
-    print(f"  Recall:    {test_recall:.4f}")
-    print(f"  F1:        {test_f1:.4f}")
+    print(f"  AUC:          {test_auc:.4f}")
+    print(f"  Accuracy:     {test_acc:.4f}")
+    print(f"  Precision:    {test_precision:.4f}")
+    print(f"  Recall:       {test_recall:.4f}")
+    print(f"  F1:           {test_f1:.4f}")
+    print(f"  Precision@10: {test_prec10:.4f}")
 
     # ── 训练集 & 验证集 AUC（辅助诊断过拟合） ──
     train_proba = model.predict_proba(X_train)[:, 1]
@@ -249,6 +260,7 @@ def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_name
         "Test_Precision": test_precision,
         "Test_Recall": test_recall,
         "Test_F1": test_f1,
+        "Precision_at_10": test_prec10,
         "Train_AUC": train_auc,
         "Val_AUC": val_auc,
         "Best_Iteration": model.best_iteration,

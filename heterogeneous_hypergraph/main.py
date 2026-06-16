@@ -61,9 +61,10 @@ def main():
 
     # ── Step 4: 测试集评估 ──
     print(f"\n[Step 4] 测试集评估...")
-    test_auc, test_acc, gamma = evaluate_model(model, data, data.test_mask)
+    test_auc, test_acc, test_prec10, gamma = evaluate_model(model, data, data.test_mask)
     print(f"  测试 AUC: {test_auc:.4f}")
     print(f"  测试 Acc: {test_acc:.4f}")
+    print(f"  Precision@10: {test_prec10:.4f}")
 
     # ── Step 5: Γ 矩阵 ──
     print(f"\n[Step 5] Γ 矩阵（关系迁移强度）:")
@@ -79,7 +80,7 @@ def main():
     # ── Step 6: 保存 ──
     print(f"\n[Step 6] 保存到 {OUTPUT_DIR}/ ...")
     torch.save(model.state_dict(), f"{OUTPUT_DIR}/model_v5.pt")
-    pd.DataFrame({"test_auc": [test_auc], "test_acc": [test_acc]}).to_csv(
+    pd.DataFrame({"test_auc": [test_auc], "test_acc": [test_acc], "precision_at_10": [test_prec10]}).to_csv(
         f"{OUTPUT_DIR}/results_v5.csv", index=False
     )
     pd.DataFrame(gamma_np, index=edge_names, columns=edge_names).to_csv(
@@ -88,8 +89,8 @@ def main():
     print(f"  [OK] model_v5.pt  [OK] results_v5.csv  [OK] gamma_matrix_v5.csv")
 
     print("\n" + "=" * 60)
-    print(f"  训练完成。Test AUC = {test_auc:.4f}")
-    print(f"  对照: v4 GNN Test AUC = 0.7619, XGBoost = 0.7362")
+    print(f"  训练完成。Test AUC = {test_auc:.4f}, Precision@10 = {test_prec10:.4f}")
+    print(f"  对照: v4 GNN Test AUC = 0.7619, v5 XGBoost = 0.7362")
     print("=" * 60)
 
 

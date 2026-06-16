@@ -13,6 +13,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import roc_auc_score, accuracy_score
@@ -238,6 +239,18 @@ def compute_losses(logit_white, logit_risk, logit_grade,
 
 
 # ═══════════════════════════════════════════════════════════
+# 工具函数
+# ═══════════════════════════════════════════════════════════
+def precision_at_k(y_true, y_score, k: int = 10):
+    """Precision@K: 模型打分最高的 K 个样本中正类的比例"""
+    if len(y_score) == 0:
+        return 0.0
+    k = min(k, len(y_score))
+    top_k_idx = np.argsort(y_score)[-k:]  # 升序取最后 k = 最高 k 个
+    return float(y_true[top_k_idx].sum()) / k
+
+
+# ═══════════════════════════════════════════════════════════
 # 评估
 # ═══════════════════════════════════════════════════════════
 @torch.no_grad()
@@ -254,7 +267,8 @@ def evaluate_model(model, data, mask):
     y_true = data.y_white[mask].cpu()
     auc = roc_auc_score(y_true, prob_w) if y_true.sum() > 0 and (1 - y_true).sum() > 0 else 0.5
     acc = accuracy_score(y_true, (prob_w >= 0.5).int())
-    return auc, acc, gamma
+    prec10 = precision_at_k(y_true.numpy(), prob_w.numpy(), k=10)
+    return auc, acc, prec10, gamma
 
 
 def _report_memory(device: torch.device):
@@ -310,8 +324,8 @@ def train(model, data, epochs: int = EPOCHS):
 
     print(f"\n  开始训练 ({epochs} epochs, 早停={patience})...")
     print(f"  {'Epoch':>5s} | {'Loss':>7s} {'W':>7s} | "
-          f"{'Γdiag':>7s} | {'ValAUC':>7s} {'Best':>7s} | {'Time':>7s}")
-    print(f"  {'─'*5:>5s}─┼{'─'*8:>8s}─┼{'─'*8:>8s}─┼{'─'*7:>7s}─┼{'─'*7:>7s}─┼{'─'*7:>7s}")
+          f"{'Γdiag':>7s} | {'ValAUC':>7s} {'P@10':>7s} {'Best':>7s} | {'Time':>7s}")
+    print(f"  {'─'*5:>5s}─┼{'─'*8:>8s}─┼{'─'*8:>8s}─┼{'─'*7:>7s}─┼{'─'*7:>7s}─┼{'─'*7:>7s}─┼{'─'*7:>7s}")
     t0 = time.time()
     t_epoch_start = time.time()
 
@@ -351,7 +365,7 @@ def train(model, data, epochs: int = EPOCHS):
         del logit_w, logit_r, logit_g, gamma, h_f, loss
 
         # ── 验证 ──
-        val_auc, val_acc, gamma_val = evaluate_model(model, data, data.val_mask)
+        val_auc, val_acc, val_prec10, gamma_val = evaluate_model(model, data, data.val_mask)
         scheduler.step(val_auc)
 
         if val_auc > best_auc:
@@ -372,7 +386,7 @@ def train(model, data, epochs: int = EPOCHS):
         t_epoch_start = t_epoch_end
 
         print(f"  {epoch+1:5d} | {loss_dict['total']:7.4f} {loss_dict['white']:7.4f} | "
-              f"{gamma_diag_val:7.3f} | {val_auc:7.4f} {best_auc:7.4f} | {elapsed_epoch:6.1f}s"
+              f"{gamma_diag_val:7.3f} | {val_auc:7.4f} {val_prec10:7.4f} {best_auc:7.4f} | {elapsed_epoch:6.1f}s"
               + (" [BEST]" if patience == EARLY_STOP_PATIENCE else ""))
 
         if patience <= 0:

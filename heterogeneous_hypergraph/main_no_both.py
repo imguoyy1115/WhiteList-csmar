@@ -75,9 +75,10 @@ def main():
 
     # ── Step 4: 测试集评估 ──
     print(f"\n[Step 4] 测试集评估...")
-    test_auc, test_acc, gamma = evaluate_model(model, data, data.test_mask)
+    test_auc, test_acc, test_prec10, gamma = evaluate_model(model, data, data.test_mask)
     print(f"  测试 AUC: {test_auc:.4f}")
     print(f"  测试 Acc: {test_acc:.4f}")
+    print(f"  Precision@10: {test_prec10:.4f}")
 
     # ── Step 5: Γ 矩阵（消融模式下为 I） ──
     print(f"\n[Step 5] Γ 矩阵（消融模式，应为单位矩阵）:")
@@ -96,12 +97,13 @@ def main():
     pd.DataFrame({
         "experiment": ["no_both"],
         "test_auc": [test_auc],
-        "test_acc": [test_acc]
+        "test_acc": [test_acc],
+        "precision_at_10": [test_prec10]
     }).to_csv(f"{OUTPUT_DIR}/results_no_both.csv", index=False)
     print(f"  [OK] model_no_both.pt  [OK] results_no_both.csv")
 
     print("\n" + "=" * 60)
-    print(f"  消融完成。Test AUC (无Γ + 无时序) = {test_auc:.4f}")
+    print(f"  消融完成。Test AUC (无Γ + 无时序) = {test_auc:.4f}, Precision@10 = {test_prec10:.4f}")
     print(f"  对照:")
     print(f"    main.py            (全架构):         ~0.7953")
     print(f"    main_no_gamma.py   (无 Γ):           ~0.8021")

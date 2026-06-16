@@ -26,7 +26,7 @@ from sklearn.model_selection import train_test_split
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_interface import HeteroGraphData
 
-CSMAR_DIR = r"D:\Users\imguoyyy\PycharmProjects\WhiteList\csmar"
+CSMAR_DIR = "/content/WhiteList-csmar/csmar"
 SEED = 42
 np.random.seed(SEED)
 

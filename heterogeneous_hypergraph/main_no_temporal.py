@@ -68,9 +68,10 @@ def main():
 
     # ── Step 4: 测试集评估 ──
     print(f"\n[Step 4] 测试集评估...")
-    test_auc, test_acc, gamma = evaluate_model(model, data, data.test_mask)
+    test_auc, test_acc, test_prec10, gamma = evaluate_model(model, data, data.test_mask)
     print(f"  测试 AUC: {test_auc:.4f}")
     print(f"  测试 Acc: {test_acc:.4f}")
+    print(f"  Precision@10: {test_prec10:.4f}")
 
     # ── Step 5: Γ 矩阵 ──
     print(f"\n[Step 5] Γ 矩阵（关系迁移强度）:")
@@ -89,12 +90,13 @@ def main():
     pd.DataFrame({
         "experiment": ["no_temporal"],
         "test_auc": [test_auc],
-        "test_acc": [test_acc]
+        "test_acc": [test_acc],
+        "precision_at_10": [test_prec10]
     }).to_csv(f"{OUTPUT_DIR}/results_no_temporal.csv", index=False)
     print(f"  [OK] model_no_temporal.pt  [OK] results_no_temporal.csv")
 
     print("\n" + "=" * 60)
-    print(f"  消融完成。Test AUC (无时序) = {test_auc:.4f}")
+    print(f"  消融完成。Test AUC (无时序) = {test_auc:.4f}, Precision@10 = {test_prec10:.4f}")
     print(f"  等待对照 main.py (含时序) 的结果做差: Δ = AUC_main - AUC_notemporal")
     print("=" * 60)
 
