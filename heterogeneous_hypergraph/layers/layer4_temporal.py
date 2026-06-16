@@ -120,7 +120,7 @@ class TemporalEncoder(nn.Module):
             gru_z = self.gru_proj(gru_last)           # (N, hidden)
 
             # Temporal Gate
-            has_any = x_seq[:, :, -1:].max(dim=1, keepdim=True).values  # (N, 1)  任一季有真实特征
+            has_any = x_seq[:, :, -1:].max(dim=1).values  # (N, 1)  任一季有真实特征
             gate_in = torch.cat([h_fusion, has_any], dim=-1)  # (N, fusion_dim+1)
             trust = self.gate_net(gate_in)            # (N, 1)  per-node gate
 
