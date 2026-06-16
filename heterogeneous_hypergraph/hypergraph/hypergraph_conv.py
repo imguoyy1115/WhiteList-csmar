@@ -5,7 +5,7 @@
 实现 "Node → Hyperedge → Node" 的两阶段消息传递。
 
 与旧版（for-loop）的关键区别：
-  - 用 scatter_mean 一次性处理所有超边，无需逐条遍历
+  - 用 _scatter_mean 一次性处理所有超边，无需逐条遍历
   - 10,660 条超边从 10,660 次 GPU 调用 → 2 次 scatter 操作
   - 预期加速 50-200x（超图卷积部分）
 
@@ -20,8 +20,33 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_mean
 from config import HYPER_HIDDEN, HYPER_LAYERS, DROPOUT
+
+
+def __scatter_mean(src: torch.Tensor, index: torch.Tensor,
+                  dim: int = 0, dim_size: int = None) -> torch.Tensor:
+    """
+    纯 PyTorch _scatter_mean —— 不依赖 torch_scatter。
+    等价于 torch_scatter._scatter_mean(src, index, dim, dim_size)。
+    """
+    if dim_size is None:
+        dim_size = int(index.max().item()) + 1 if index.numel() > 0 else 0
+
+    if dim_size == 0:
+        return torch.zeros(0, src.size(1) if src.ndim > 1 else 1,
+                          dtype=src.dtype, device=src.device)
+
+    # index_add_ 求和
+    out = torch.zeros(dim_size, src.size(1) if src.ndim > 1 else 1,
+                      dtype=src.dtype, device=src.device)
+    out.index_add_(0, index, src)
+
+    # 计数（每目标行被 hit 多少次）
+    count = torch.zeros(dim_size, device=src.device)
+    count.index_add_(0, index, torch.ones(index.size(0), device=src.device))
+    count = count.clamp(min=1)
+
+    return out / count.unsqueeze(-1) if out.ndim > 1 else out / count
 
 
 def hyperedges_list_to_index(he_list: list, device: torch.device) -> torch.Tensor:
@@ -53,8 +78,8 @@ class HypergraphConv(nn.Module):
     单张超图上的卷积层（向量化 scatter 实现）。
 
     前向流程：
-      1. Node → Hyperedge:  scatter_mean(x_proj[node_ids], he_ids) → 超边表示
-      2. Hyperedge → Node:  scatter_mean(edge_reprs[he_ids], node_ids) → 节点更新
+      1. Node → Hyperedge:  _scatter_mean(x_proj[node_ids], he_ids) → 超边表示
+      2. Hyperedge → Node:  _scatter_mean(edge_reprs[he_ids], node_ids) → 节点更新
       3. 残差连接 + LayerNorm + Dropout
     ==========================================================================
     """
@@ -86,12 +111,12 @@ class HypergraphConv(nn.Module):
 
         # ── Step 1: Node → Hyperedge ──
         x_proj = self.node_to_edge(x)                        # (N, out_dim)
-        edge_reprs = scatter_mean(x_proj[node_ids], he_ids, dim=0)  # (E, out_dim)
+        edge_reprs = _scatter_mean(x_proj[node_ids], he_ids, dim=0)  # (E, out_dim)
         edge_reprs = self.edge_to_node(edge_reprs)
         edge_reprs = F.relu(edge_reprs)
 
         # ── Step 2: Hyperedge → Node ──
-        node_agg = scatter_mean(
+        node_agg = _scatter_mean(
             edge_reprs[he_ids], node_ids,
             dim=0, dim_size=N
         )  # (N, out_dim)
