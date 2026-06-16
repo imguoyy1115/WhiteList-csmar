@@ -263,7 +263,7 @@ def train(model, data, epochs: int = EPOCHS):
 
     # ── AMP 混合精度 ──
     use_amp = USE_AMP and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
     print(f"  AMP 混合精度: {'启用' if use_amp else '关闭'}")
 
     # ── 优化器 ──
@@ -298,8 +298,8 @@ def train(model, data, epochs: int = EPOCHS):
         model.train()
         optimizer.zero_grad()
 
-        # ── 全批量前向 ──
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        # ── 全批量前向（AMP） ──
+        with torch.amp.autocast("cuda", enabled=use_amp):
             logit_w, logit_r, logit_g, gamma, h_f = model(
                 data.x_dict, data.edge_index_dict, data.hyperedges,
                 data.num_enterprises,
@@ -316,11 +316,16 @@ def train(model, data, epochs: int = EPOCHS):
             )
 
         # ── 反向 ──
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         del logit_w, logit_r, logit_g, gamma, h_f, loss
 

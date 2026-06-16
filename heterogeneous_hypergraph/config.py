@@ -66,7 +66,7 @@ LR_HYPER = 3e-4            # 超图通道学习率（单独设置，更保守）
 WEIGHT_DECAY = 5e-4
 EARLY_STOP_PATIENCE = 80
 
-USE_AMP = False            # AMP 混合精度（仅 CUDA 有效，CPU 调试先关掉）
+USE_AMP = True             # AMP 混合精度（T4 开 AMP 加速 ~1.5-2x，省显存）
 
 # ── 阶段性训练 ──
 PHASE1_EPOCHS = 80         # Phase 1: 预热异构通道

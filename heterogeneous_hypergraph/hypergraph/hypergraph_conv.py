@@ -1,109 +1,103 @@
 """
 ================================================================================
-超图卷积层（Hypergraph Convolution）
+超图卷积层（Hypergraph Convolution）— 向量化版本
 ================================================================================
 实现 "Node → Hyperedge → Node" 的两阶段消息传递。
 
-支持 4 张超图独立卷积 + 多视图注意力融合。
+与旧版（for-loop）的关键区别：
+  - 用 scatter_mean 一次性处理所有超边，无需逐条遍历
+  - 10,660 条超边从 10,660 次 GPU 调用 → 2 次 scatter 操作
+  - 预期加速 50-200x（超图卷积部分）
 
-参考：HyperGCN (Yadati et al., NeurIPS 2019)
-      HGNN+ (Gao et al., AAAI 2020)
-简化实现：mean/attention 聚合，适合 CPU + mini-batch 训练。
+输入格式：
+  hyperedge_index: (2, E_total) LongTensor
+    [0, :] = hyperedge ID
+    [1, :] = node ID
+  等价于将超边列表展平为 COO 格式。
 ================================================================================
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_scatter import scatter_mean
 from config import HYPER_HIDDEN, HYPER_LAYERS, DROPOUT
+
+
+def hyperedges_list_to_index(he_list: list, device: torch.device) -> torch.Tensor:
+    """
+    将超边列表（每条超边是一个 node ID tensor）转换为扁平索引。
+
+    输入: [tensor([A,B,C]), tensor([D,E]), ...]
+    输出: tensor([[0,0,0,1,1,...],   ← hyperedge ID
+                  [A,B,C,D,E,...]])   ← node ID
+    """
+    if not he_list:
+        return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+    he_ids_parts = []
+    node_ids_parts = []
+    for i, he in enumerate(he_list):
+        n = len(he)
+        he_ids_parts.append(torch.full((n,), i, dtype=torch.long))
+        node_ids_parts.append(he.long())
+
+    he_ids = torch.cat(he_ids_parts)
+    node_ids = torch.cat(node_ids_parts)
+    return torch.stack([he_ids, node_ids]).to(device)
 
 
 class HypergraphConv(nn.Module):
     """
     ==========================================================================
-    单张超图上的卷积层。
+    单张超图上的卷积层（向量化 scatter 实现）。
 
     前向流程：
-      1. Node → Hyperedge:  聚合超边内所有节点的特征 → 超边表示
-      2. Hyperedge → Node:  聚合包含某节点的所有超边表示 → 更新节点表示
+      1. Node → Hyperedge:  scatter_mean(x_proj[node_ids], he_ids) → 超边表示
+      2. Hyperedge → Node:  scatter_mean(edge_reprs[he_ids], node_ids) → 节点更新
       3. 残差连接 + LayerNorm + Dropout
     ==========================================================================
     """
-    def __init__(self, in_dim: int, out_dim: int, aggr: str = "mean",
+    def __init__(self, in_dim: int, out_dim: int,
                  dropout: float = DROPOUT):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.aggr = aggr
 
-        # 节点 → 超边 的消息变换
         self.node_to_edge = nn.Linear(in_dim, out_dim)
-        # 超边 → 节点 的消息变换
         self.edge_to_node = nn.Linear(out_dim, out_dim)
-
-        # 如果 in_dim ≠ out_dim，需要投影做残差
         self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
-
         self.norm = nn.LayerNorm(out_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, hyperedges: list) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                hyperedge_index: torch.Tensor) -> torch.Tensor:
         """
-        ==========================================================================
-        x: (N, in_dim)  所有 enterprise 节点的特征
-        hyperedges: list of (k,) tensors, 每条超边是一组节点 ID
-
-        返回: (N, out_dim)  更新后的节点特征
-        ==========================================================================
+        x: (N, in_dim)
+        hyperedge_index: (2, E_total)  [he_id, node_id]
+        返回: (N, out_dim)
         """
-        N = x.shape[0]
-        device = x.device
-
-        if not hyperedges:
-            # 没有超边 → 直通
+        if hyperedge_index.numel() == 0:
             return self.dropout(F.relu(self.skip(x)))
 
+        N = x.shape[0]
+        he_ids = hyperedge_index[0]   # (E_total,)
+        node_ids = hyperedge_index[1]  # (E_total,)
+
         # ── Step 1: Node → Hyperedge ──
-        #     对每条超边，聚合其成员节点的特征
-        x_proj = self.node_to_edge(x)  # (N, out_dim)
-
-        edge_reprs = []  # 每条超边的表示
-        edge_sizes = []  # 每条超边的大小（用于归一化）
-
-        for he in hyperedges:
-            he = he.to(device)
-            members = x_proj[he]  # (k, out_dim)
-            if self.aggr == "mean":
-                edge_repr = members.mean(dim=0)  # (out_dim,)
-            elif self.aggr == "attention":
-                # 简化 attention: 用节点特征自身做 self-attention
-                attn = torch.softmax((members * members).sum(dim=-1), dim=0)  # (k,)
-                edge_repr = (members * attn.unsqueeze(-1)).sum(dim=0)
-            else:
-                edge_repr = members.mean(dim=0)
-            edge_reprs.append(edge_repr)
-            edge_sizes.append(len(he))
-
-        edge_matrix = torch.stack(edge_reprs)  # (E, out_dim)
-        edge_matrix = self.edge_to_node(edge_matrix)
-        edge_matrix = F.relu(edge_matrix)
+        x_proj = self.node_to_edge(x)                        # (N, out_dim)
+        edge_reprs = scatter_mean(x_proj[node_ids], he_ids, dim=0)  # (E, out_dim)
+        edge_reprs = self.edge_to_node(edge_reprs)
+        edge_reprs = F.relu(edge_reprs)
 
         # ── Step 2: Hyperedge → Node ──
-        #     对每个节点，聚合所有包含它的超边表示
-        node_agg = torch.zeros(N, self.out_dim, device=device)
-        node_cnt = torch.zeros(N, device=device)
-
-        for i, he in enumerate(hyperedges):
-            he = he.to(device)
-            node_agg[he] += edge_matrix[i]  # scatter add
-            node_cnt[he] += 1
-
-        # 归一化（避免度偏置）
-        node_cnt = node_cnt.clamp(min=1)
-        h_new = node_agg / node_cnt.unsqueeze(-1)
+        node_agg = scatter_mean(
+            edge_reprs[he_ids], node_ids,
+            dim=0, dim_size=N
+        )  # (N, out_dim)
 
         # ── 残差 + Norm + Dropout ──
-        h_new = h_new + self.skip(x)
+        h_new = node_agg + self.skip(x)
         h_new = self.norm(h_new)
         h_new = self.dropout(F.relu(h_new))
 
@@ -117,8 +111,11 @@ class MultiViewHyperEncoder(nn.Module):
 
     对 4 张超图分别做卷积，然后通过注意力融合。
 
-    输入: x (N, in_dim)  +  hyperedges_dict {"supply": [...], "equity": [...], ...}
-    输出: h_struct (N, hidden)  结构角色表示
+    输入: x (N, in_dim) + hyperedges_dict
+          支持两种格式：
+            - list of tensors（自动转换为 flat index，首次转换后缓存）
+            - (2, E) flat index tensor（直接使用）
+    输出: h_struct (N, hidden)
     ==========================================================================
     """
     def __init__(self, in_dim: int, hidden: int = HYPER_HIDDEN,
@@ -127,41 +124,51 @@ class MultiViewHyperEncoder(nn.Module):
         self.hidden = hidden
         self.num_layers = num_layers
 
-        # 输入投影
         self.input_proj = nn.Linear(in_dim, hidden)
 
-        # 每个视图独立的多层超图卷积
         self.view_convs = nn.ModuleDict()
-        view_names = ["supply", "equity", "legal_rep", "industry"]
-        for vname in view_names:
+        self.view_names = ["supply", "equity", "legal_rep", "industry"]
+        for vname in self.view_names:
             layers = []
             for _ in range(num_layers):
-                layers.append(HypergraphConv(hidden, hidden, aggr="mean", dropout=dropout))
+                layers.append(HypergraphConv(hidden, hidden, dropout=dropout))
             self.view_convs[vname] = nn.ModuleList(layers)
 
-        # 视图级注意力融合
         self.view_attn = nn.Linear(hidden, 1)
-        self.view_names = view_names
-
         self.dropout = nn.Dropout(dropout)
+
+        # 缓存：首次将 list 格式转 flat index 后存这里，后续直接复用
+        self._index_cache = {}
+
+    def _get_flat_index(self, vname: str, he_data, device: torch.device):
+        """获取或构建超边的 flat index 格式"""
+        if isinstance(he_data, torch.Tensor) and he_data.ndim == 2:
+            # 已经是 (2, E) 格式
+            return he_data.to(device)
+
+        # list 格式 → 转换并缓存
+        cache_key = f"{vname}_{device}"
+        if cache_key not in self._index_cache:
+            self._index_cache[cache_key] = hyperedges_list_to_index(he_data, torch.device("cpu"))
+        return self._index_cache[cache_key].to(device)
 
     def forward(self, x: torch.Tensor,
                 hyperedges: dict) -> torch.Tensor:
         """
-        ==========================================================================
-        x: (N, in_dim)  enterprise 节点的初始特征（13维，投影前）
-        hyperedges: {"supply": [tensor, ...], "equity": [...], ...}
-
-        返回: h_struct (N, hidden)  融合后的结构角色表示
-        ==========================================================================
+        x: (N, in_dim)
+        hyperedges: {"supply": [...], "equity": [...], ...}
+        返回: h_struct (N, hidden)
         """
         x = self.input_proj(x)  # (N, hidden)
 
         view_outputs = []
         for vname in self.view_names:
+            he_data = hyperedges.get(vname, [])
+            he_index = self._get_flat_index(vname, he_data, x.device)
+
             h_v = x
             for conv in self.view_convs[vname]:
-                h_v = conv(h_v, hyperedges.get(vname, []))
+                h_v = conv(h_v, he_index)
             view_outputs.append(h_v)  # (N, hidden)
 
         # 注意力融合
