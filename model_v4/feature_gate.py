@@ -21,7 +21,7 @@ class AdaptiveFeatureGate(nn.Module):
     ==========================================================================
     每个节点 × 每个维度独立学习信任权重 α[i,d]
 
-    gate_input = concat[ X, M, expand(struct_hint) ]
+    gate_input = concat[ X, M, struct_hint ]
     α = sigmoid( MLP(gate_input) )
     out = α ⊙ X  +  (1-α) ⊙ X_struct
     ==========================================================================
@@ -36,6 +36,7 @@ class AdaptiveFeatureGate(nn.Module):
         self.gate_net = nn.Sequential(
             nn.Linear(gate_in, hidden),
             nn.ReLU(),
+            nn.Dropout(0.2),          # 防 gate 过拟合，避免 α 后期退化
             nn.Linear(hidden, feature_dim),
         )
 
@@ -60,36 +61,25 @@ class AdaptiveFeatureGate(nn.Module):
         N, D = X.shape
         device = X.device
 
-        # 1. struct_hint 广播到 (N, D) 以便 concat
-        if struct_hint.shape[1] < D:
-            # 用线性层把 S 维扩到 D 维（或用 repeat）
-            S = struct_hint.shape[1]
-            hint_expanded = torch.zeros(N, D, device=device)
-            # 简单策略：前 S 维用 struct_hint，后面补零
-            hint_expanded[:, :S] = struct_hint
-        else:
-            hint_expanded = struct_hint[:, :D]
-
-        # 2. 门控输入
-        gate_input = torch.cat([X, M, hint_expanded], dim=-1)  # (N, 2D + D)
+        # 1. 门控输入：直接拼接原始 struct_hint（不广播到 D 维）
+        gate_input = torch.cat([X, M, struct_hint], dim=-1)  # (N, D + D + S)
         alpha = torch.sigmoid(self.gate_net(gate_input))        # (N, D)
 
-        # 3. 精炼结构特征
+        # 2. 精炼结构特征
         X_struct_refined = self.struct_refine(X_struct)          # (N, D)
 
-        # 4. 自适应融合
+        # 3. 自适应融合
         X_gated = alpha * X + (1.0 - alpha) * X_struct_refined
+
+        # 记录信任度均值（供训练循环诊断，不改返回值）
+        self.last_alpha_mean = alpha.mean().item()
 
         return X_gated
 
     def get_trust_stats(self, X, M, struct_hint, X_struct):
         """返回信任度统计（用于诊断和分析）"""
         with torch.no_grad():
-            N, D = X.shape
-            S = struct_hint.shape[1]
-            hint_expanded = torch.zeros(N, D, device=X.device)
-            hint_expanded[:, :S] = struct_hint
-            gate_input = torch.cat([X, M, hint_expanded], dim=-1)
+            gate_input = torch.cat([X, M, struct_hint], dim=-1)
             alpha = torch.sigmoid(self.gate_net(gate_input))
 
         return {

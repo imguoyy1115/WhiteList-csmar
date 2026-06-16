@@ -38,7 +38,7 @@ class CrossRelationPropagation(nn.Module):
         # ---- Γ 矩阵：关系迁移强度 ----
         raw_gamma = torch.randn(self.R, self.R)
         if gamma_init == "identity":
-            raw_gamma = raw_gamma * 0.01 + torch.eye(self.R) * 5.0
+            raw_gamma = raw_gamma * 0.01 + torch.eye(self.R) * 1.0
         self.gamma_raw = nn.Parameter(raw_gamma)
 
         # ---- 每种边类型的变换矩阵 W_r ----

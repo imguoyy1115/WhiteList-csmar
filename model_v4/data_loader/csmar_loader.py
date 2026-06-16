@@ -1,10 +1,11 @@
 """
 ================================================================================
-CSMAR 数据加载器 v3 — 全向量化版
+CSMAR 数据加载器 v4 — 全向量化 + 数据过滤版
 ================================================================================
-改动：全部 iterrows() 替换为 pandas apply + 预计算 ID 数组
-优势：380万次迭代 → ~20万次 apply，速度提升约 100 倍
-劣势：高内存占用（pandas apply 返回 Python 对象数组），但 16GB 内存够用
+v4 新增三道数据过滤：
+  1. 排除金融业（IndustryCode 以 J 开头）→ 提升 Scaler 拟合质量
+  2. 标记 ST/异常公司（StateTypeCode ≠ "1"）→ 不删除但追踪
+  3. 时间窗口切边（trade≥2022, lawsuit≥2020）→ 减少噪声 + 降显存
 ================================================================================
 """
 import os, sys
@@ -15,9 +16,17 @@ from collections import defaultdict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_interface import HeteroGraphData
+from config import SEED
 
 CSMAR_DIR = r"D:\Users\imguoyyy\PycharmProjects\WhiteList\csmar"
 SEED = 42; np.random.seed(SEED)
+
+# ═══════════════════════════════════════════════════════════
+# 过滤配置
+# ═══════════════════════════════════════════════════════════
+EXCLUDE_FINANCE = True       # 排除金融业（J 开头行业代码）
+MIN_TRADE_DATE = "2022-01-01"  # trade 边只保留 2022 年及之后
+MIN_LAWSUIT_DATE = "2020-01-01"  # 诉讼只保留 2020 年及之后
 
 # ── helpers ──
 def _clean(s):
@@ -78,13 +87,40 @@ def load_all():
 # ═══════════════════════════════════════════════════════════
 def build_entities(T):
     print("\n[2/5] Entity discovery...")
+    filters = {"finance_excluded": 0, "st_marked": 0}
 
-    # listed companies
+    # ── 行业信息：排除金融业 ──
+    finance_codes = set()
+    if EXCLUDE_FINANCE:
+        for dfk in ["scf_ov", "scf_credit"]:
+            df = T[dfk]
+            if "IndustryCode" not in df.columns or "Symbol" not in df.columns:
+                continue
+            mask_fin = df["IndustryCode"].astype(str).str.strip().str.startswith("J")
+            codes = df.loc[mask_fin, "Symbol"].astype(str).str.strip().str.zfill(6)
+            finance_codes.update(codes[codes.str.isdigit()].values)
+        print(f"  金融业企业: {len(finance_codes)}")
+
+    # ── ST 标记 ──
+    st_codes = set()
+    for dfk in ["scf_credit", "scf_ar", "scf_ap"]:
+        df = T[dfk]
+        if "StateTypeCode" not in df.columns or "Symbol" not in df.columns:
+            continue
+        mask_st = df["StateTypeCode"].astype(str).str.strip() != "1"
+        codes = df.loc[mask_st, "Symbol"].astype(str).str.strip().str.zfill(6)
+        st_codes.update(codes[codes.str.isdigit()].values)
+    print(f"  ST/异常状态企业: {len(st_codes)}")
+
+    # listed companies (排除金融业)
     listed = set()
     for k in ["solvency","profit","operation","growth","cashflow","risklevel"]:
         codes = T[k]["Stkcd"].dropna().astype(str).str.strip().str.zfill(6)
         listed.update(codes[codes.str.isdigit()].values)
-    print(f"  Listed: {len(listed)}")
+    filters["finance_excluded"] = len(listed & finance_codes)
+    if EXCLUDE_FINANCE:
+        listed -= finance_codes  # ← 核心过滤：踢掉金融业
+    print(f"  Listed: {len(listed)} (剔除金融业 {filters['finance_excluded']} 家)")
 
     # name→code hashmap (vectorized: 1M rows → 50K unique names)
     name2code = {}
@@ -155,6 +191,7 @@ def build_entities(T):
         "n_total": n_total, "n_listed": len(listed),
         "code2id": code2id, "s2id": s2id,
         "name2code": name2code, "cp_matched": cp_matched,
+        "st_codes": st_codes, "finance_codes": finance_codes,
     }
 
 # ═══════════════════════════════════════════════════════════
@@ -163,7 +200,7 @@ def build_entities(T):
 def build_features(T, E):
     print("\n[3/5] Node features...")
     n, nl = E["n_total"], E["n_listed"]
-    DIM = 23
+    DIM = 25  # 23 维财务特征 + 2 维诉讼严重程度
     X = np.zeros((n, DIM), dtype=np.float32)
     M = np.ones((n, DIM), dtype=np.float32)  # 缺失指示：1=缺失 0=已填充
     col = 0
@@ -181,7 +218,8 @@ def build_features(T, E):
         df = T[tab_key].copy()
         df["code"] = df["Stkcd"].astype(str).apply(_stock)
         if "Typrep" in df.columns:
-            df = df[df["Typrep"].astype(str)=="1"]
+            # 取半年报(B)，一年两期(6月+12月)，方便后续时序建模
+            df = df[df["Typrep"].astype(str).str.upper() == "B"]
         df = df.sort_values("Accper").groupby("code").last().reset_index()
         eid_arr = df["code"].apply(lambda c: ent_id(c, E)).values
         for fcol in fmap:
@@ -221,14 +259,86 @@ def build_features(T, E):
                     M[eid, col] = 0.0  # 标记为已填充
         col += 1
 
-    # 特征归一化：只在有真实值的上市公司上拟合，再 transform 全量
+    # 3.4 诉讼严重程度特征（LAValue 按企业聚合 + 缩尾 + 双指标）
+    #     对 LAValue 做缩尾处理（下限 1 元，上限 P99.5=14.2 亿），缺失填中位数
+    #     指标1: log(1 + 时间窗口内 LAValue 总和) — 累计风险暴露
+    #     指标2: log(1 + 加权严重分) — 小案(<500万)=1, 中案(500-5000万)=3, 大案(>5000万)=10
+    la_full = T["lawsuit"]
+    min_la_ts = pd.Timestamp(MIN_LAWSUIT_DATE)
+    la_dates = None
+    for dc in ["EventSignDate", "DeclareDate"]:
+        if dc in la_full.columns:
+            la_dates = pd.to_datetime(la_full[dc], errors="coerce")
+            break
+    la_val = pd.to_numeric(la_full["LAValue"], errors="coerce")
+    la_median = la_val.median()
+    la_val = la_val.fillna(la_median).clip(lower=1, upper=1_420_000_000)
+    la_src = la_full["Symbol"].astype(str).apply(lambda x: ent_id(x, E)).values
+
+    ent_la_sum = defaultdict(float)
+    ent_severity = defaultdict(float)
+    for i in range(len(la_full)):
+        if la_dates is not None:
+            d = la_dates.iloc[i]
+            if pd.notna(d) and d < min_la_ts:
+                continue
+        eid = int(la_src[i])
+        if eid < 0 or eid >= nl:
+            continue
+        v = la_val.iloc[i]
+        ent_la_sum[eid] += v
+        # 严重程度加权
+        if v < 5_000_000:
+            ent_severity[eid] += 1
+        elif v < 50_000_000:
+            ent_severity[eid] += 3
+        else:
+            ent_severity[eid] += 10
+
+    for i in range(n):
+        X[i, col] = np.log1p(ent_la_sum.get(i, 0))
+        M[i, col] = 0.0
+    col += 1
+    for i in range(n):
+        X[i, col] = np.log1p(ent_severity.get(i, 0))
+        M[i, col] = 0.0
+    col += 1
+
+    # 特征归一化：只在有真实值且非 ST 的上市公司上拟合，再 transform 全量
     from sklearn.preprocessing import StandardScaler
+    st_codes = E.get("st_codes", set())
+    code2id = E["code2id"]
+    # 找到 ST 公司对应的 ID
+    st_ids = set()
+    for code in st_codes:
+        if code in code2id:
+            st_ids.add(code2id[code])
+    mask_normal = np.ones(nl, dtype=bool)
+    for sid in st_ids:
+        if sid < nl:
+            mask_normal[sid] = False
     mask_real = (X[:nl].sum(axis=1) > 0)
-    scaler = StandardScaler().fit(X[:nl][mask_real])
+    mask_fit = mask_real & mask_normal  # 有真实特征 + 非 ST
+    scaler = StandardScaler().fit(X[:nl][mask_fit])
     X = scaler.transform(X)
 
-    print(f"  Feature dim: {DIM}, coverage: {(X[:nl].sum(1)>0).sum()}/{nl}")
-    return X, M
+    print(f"  Feature dim: {DIM}, coverage: {mask_real.sum()}/{nl}"
+          f" (ST: {len(st_ids & set(range(nl)))})")
+
+    # 3.5 季度序列特征 X_seq (N, 4, DIM+1) — v4.3 Temporal GRU
+    #     前 DIM 列：季度特征（当前为 Q4 重复，待真实季度数据就绪后替换）
+    #     第 DIM 列：has_feature_q — 该季度是否有真实数据
+    X_seq = np.zeros((n, 4, DIM + 1), dtype=np.float32)
+    for q in range(4):
+        X_seq[:, q, :DIM] = X.copy()  # 当前用 Q4 特征作为各季度基线
+        X_seq[:, q, DIM] = (X.sum(axis=-1) > 0).astype(np.float32)
+
+    # 应用 scaler 到 X 和各季度
+    X = scaler.transform(X)
+    for q in range(4):
+        X_seq[:, q, :DIM] = scaler.transform(X_seq[:, q, :DIM])
+
+    return X, M, X_seq
 
 # ═══════════════════════════════════════════════════════════
 # Step 4: Edges (vectorized)
@@ -237,20 +347,32 @@ def build_edges(T, E):
     print("\n[4/5] Building edges...")
     ei = {}
 
-    # 4.1 trade
+    # 4.1 trade（加时间窗口过滤）
     trade_set = set()
+    trade_skipped = 0
+    min_trade_ts = pd.Timestamp(MIN_TRADE_DATE)
     for dfk in ["scf_ar","scf_ap"]:
         df = T[dfk]
         if "Symbol" not in df.columns or "DebtName" not in df.columns:
             continue
+        # 时间过滤
+        if "EndDate" in df.columns:
+            dates = pd.to_datetime(df["EndDate"], errors="coerce")
+        else:
+            dates = None
         src = df["Symbol"].astype(str).apply(lambda x: ent_id(x, E)).values
         dst = df["DebtName"].astype(str).apply(lambda x: ent_id(x, E)).values
         amt = pd.to_numeric(df.get("EndingAmount", 0), errors="coerce").fillna(0).values
         for i in range(len(df)):
-            s,d = int(src[i]), int(dst[i])
-            if s >= 0 and d >= 0 and s != d:
-                trade_set.add((s, d, float(amt[i])))
-    print(f"  trade: {len(trade_set)} edges")
+            if dates is not None:
+                d = dates.iloc[i]
+                if pd.notna(d) and d < min_trade_ts:
+                    trade_skipped += 1
+                    continue
+            s,d_id = int(src[i]), int(dst[i])
+            if s >= 0 and d_id >= 0 and s != d_id:
+                trade_set.add((s, d_id, float(amt[i])))
+    print(f"  trade: {len(trade_set)} edges (跳过 {trade_skipped} 条过期 trade)")
 
     # 4.2 equity（采样20万行）
     eq_set = set()
@@ -275,19 +397,11 @@ def build_edges(T, E):
     # 4.3 same_industry
     print(f"  same_industry: 0 (skipped)")
 
-    # 4.4 involved_in
-    iv_set = set()
-    la = T["lawsuit"]
-    LIMIT_LA = 50000
-    if len(la) > LIMIT_LA:
-        la = la.sample(LIMIT_LA, random_state=SEED)
-    src = la["Symbol"].astype(str).apply(lambda x: ent_id(x, E)).values
-    eids = la["EventID"].astype(str).values
-    for i in range(len(la)):
-        s = int(src[i])
-        if s >= 0 and eids[i]:
-            iv_set.add((s, eids[i], 0.0))
-    print(f"  involved_in: {len(iv_set)} events")
+    # 4.4 involved_in — 已移除（v4.2）
+    #     原因：边方向 enterprise→riskevent，消息只流入 riskevent 节点，
+    #     下游只取 h["enterprise"]，riskevent embedding 从未被使用。
+    #     诉讼信息已通过企业级特征（log 总金额 + 加权严重分）进入模型。
+    print(f"  involved_in: 0 (已移除，诉讼信息已并入企业特征)")
 
     # to tensors
     if trade_set:
@@ -296,13 +410,8 @@ def build_edges(T, E):
     if eq_set:
         ei[("enterprise","equity","enterprise")] = torch.tensor(
             [(s,d) for s,d,w in eq_set]).long().t()
-    if iv_set:
-        ev_ids = sorted(set(e[1] for e in iv_set))
-        ev_map = {eid:i for i,eid in enumerate(ev_ids)}
-        pairs = [(s, ev_map[eid]) for s,eid,sev in iv_set]
-        ei[("enterprise","involved_in","riskevent")] = torch.tensor(pairs).long().t()
 
-    return ei, {eid:i for i,eid in enumerate(sorted(set(e[1] for e in iv_set)))} if iv_set else {}
+    return ei
 
 # ═══════════════════════════════════════════════════════════
 # Step 4.5: 结构特征（邻域聚合 + 图统计量）
@@ -386,7 +495,7 @@ def compute_structural_features(X, edge_index, n, nl):
 # ═══════════════════════════════════════════════════════════
 # Step 5: Labels + Assembly
 # ═══════════════════════════════════════════════════════════
-def build_labels_and_assemble(T, E, X, M_features, edge_index, event_map):
+def build_labels_and_assemble(T, E, X, M_features, X_seq, edge_index):
     print("\n[5/5] Labels + assembly...")
     n, nl = E["n_total"], E["n_listed"]
 
@@ -437,18 +546,27 @@ def build_labels_and_assemble(T, E, X, M_features, edge_index, event_map):
     x_dict = {
         "enterprise": torch.tensor(X),
     }
-    if event_map:
-        x_dict["riskevent"] = torch.zeros((len(event_map), 3))
 
     x_struct = {"enterprise": torch.tensor(X_struct)}
     x_missing = {"enterprise": torch.tensor(M)}
     struct_hint_dict = {"enterprise": torch.tensor(struct_hint)}
 
-    # masks
+    # masks — 分层随机切分，确保 train/val/test 标签分布一致
+    from sklearn.model_selection import train_test_split
     n_train, n_val = int(nl*0.7), int(nl*0.15)
-    train = torch.zeros(n, dtype=bool); train[:n_train] = True
-    val   = torch.zeros(n, dtype=bool); val[n_train:n_train+n_val] = True
-    test  = torch.zeros(n, dtype=bool); test[n_train+n_val:nl] = True
+    all_idx = np.arange(nl)
+    y_listed = y_white[:nl]
+    # 第一刀：train 70% vs rest 30%，按白名单标签分层
+    train_idx, rest_idx = train_test_split(
+        all_idx, test_size=0.3, stratify=y_listed, random_state=SEED)
+    # 第二刀：rest 对半分 val 15% / test 15%
+    y_rest = y_listed[rest_idx]
+    val_idx, test_idx = train_test_split(
+        rest_idx, test_size=0.5, stratify=y_rest, random_state=SEED)
+
+    train = torch.zeros(n, dtype=bool); train[train_idx] = True
+    val   = torch.zeros(n, dtype=bool); val[val_idx] = True
+    test  = torch.zeros(n, dtype=bool); test[test_idx] = True
 
     data = HeteroGraphData(
         x_dict=x_dict, edge_index_dict=edge_index,
@@ -458,6 +576,7 @@ def build_labels_and_assemble(T, E, X, M_features, edge_index, event_map):
         num_enterprises=n,
         x_struct=x_struct, x_missing=x_missing,
         struct_hint=struct_hint_dict,
+        x_seq=torch.tensor(X_seq),  # v4.3: (N, 4, DIM+1) 季度序列
     )
     data.summary()
     return data
@@ -473,14 +592,17 @@ def load_csmar_data():
     t0 = time.time()
     E = build_entities(T); stages.append(("Entities",time.time()-t0))
     t0 = time.time()
-    X, M_feat = build_features(T, E); stages.append(("Features",time.time()-t0))
+    X, M_feat, X_seq = build_features(T, E); stages.append(("Features",time.time()-t0))
     t0 = time.time()
-    ei, ev_map = build_edges(T, E); stages.append(("Edges",time.time()-t0))
+    ei = build_edges(T, E); stages.append(("Edges",time.time()-t0))
     t0 = time.time()
-    data = build_labels_and_assemble(T, E, X, M_feat, ei, ev_map); stages.append(("Assembly",time.time()-t0))
+    data = build_labels_and_assemble(T, E, X, M_feat, X_seq, ei); stages.append(("Assembly",time.time()-t0))
     print("\nTiming:")
     for name,sec in stages:
         print(f"  {name}: {sec:.1f}s")
+    print("\n  数据过滤统计:")
+    print(f"    金融业排除: {EXCLUDE_FINANCE}, ST标记: {len(E['st_codes'])} 家")
+    print(f"    Trade时间窗口: ≥{MIN_TRADE_DATE}, 诉讼时间窗口: ≥{MIN_LAWSUIT_DATE}")
     return data
 
 if __name__ == "__main__":

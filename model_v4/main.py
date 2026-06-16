@@ -36,7 +36,7 @@ if __name__ == "__main__":
     print(f"  总参数量: {n_params:,}")
     print(f"  节点类型: {list(in_dims.keys())}")
     print(f"  边类型: {model.edge_names}")
-    print(f"  架构: Layer2(R-GAT 3层双通道) + Layer3(Γ矩阵) + Layer4(GRU) + 3预测头")
+    print(f"  架构: Layer2(SAGE 2层) + Layer3(Γ矩阵) + Layer4(GRU lazy) + 3预测头")
 
     # ---- 3. 训练 ----
     model = train(model, data)

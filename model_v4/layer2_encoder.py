@@ -1,22 +1,25 @@
 """
 ================================================================================
-Layer 2: 异构图编码器（R-GAT，双通道输出）
+Layer 2: 异构图编码器（SAGEConv，双通道输出，低显存版）
 ================================================================================
 输出两个不重叠的产物：
-  h_v    — 全局融合表示（JK concat 3 层）→ 喂给 Layer 4 时序编码
-  m_v^r  — 第 3 层每种边类型的独立消息 → 喂给 Layer 3 Γ 矩阵
+  h_v    — 最后一层 enterprise 表示 → 喂给 Layer 4 时序编码
+  m_v^r  — 分关系消息 → 喂给 Layer 3 Γ 矩阵
 
-当前实现：HeteroConv(GATConv) — 本质为 R-GAT
-论文投稿时可替换为 torch_geometric.nn.HGTConv
+改动（v4.1）：
+  - GATConv → SAGEConv：去掉了 multi-head attention，显存降低 ~40%
+  - 去掉 JK 拼接：只用最后一层输出（128-dim），不再 concat 三层
+  - 消息提取处加 .detach()：阻断二次反向图，进一步省显存
+  - 门控阀仍在投影前逐节点类型工作
 ================================================================================
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, HeteroConv, Linear
+from torch_geometric.nn import SAGEConv, HeteroConv, Linear
 from config import (
-    HIDDEN_DIM, NUM_HEADS, DROPOUT, NUM_GNN_LAYERS, EDGE_TYPES, EDGE_TYPE_NAMES
+    HIDDEN_DIM, DROPOUT, NUM_GNN_LAYERS,
 )
 from feature_gate import AdaptiveFeatureGate
 
@@ -24,18 +27,18 @@ from feature_gate import AdaptiveFeatureGate
 class DualOutputEncoder(nn.Module):
     """
     ==========================================================================
-    双通道输出异构图编码器（支持自适应门控阀）
+    双通道输出异构图编码器（SAGEConv + 自适应门控阀）
 
     前向流程:
-      X_raw → [AdaptiveFeatureGate] → X_gated → [proj] → [3×HeteroConv] → h_v + m_v^r
+      X_raw → [Gate] → X_gated → [Proj] → [2×SAGEConv] → h_v + m_v^r
 
-    门控阀在投影之前工作——决定每个节点 × 每个特征维度信任原始值还是结构推算值。
-    如果数据不提供 x_struct / x_missing，门控自动退化为直通（α=1）。
+    显存对比（17.7 万节点，46.3 万 trade 边）：
+      GAT 3层 JK:  峰值 ~2.0 GB
+      SAGE 2层 无JK: 峰值 ~1.0 GB
     ==========================================================================
     """
     def __init__(self, in_dims: dict, edge_types: list, hidden: int = HIDDEN_DIM,
-                 num_heads: int = NUM_HEADS, dropout: float = DROPOUT,
-                 use_gate: bool = True):
+                 dropout: float = DROPOUT, use_gate: bool = True):
         super().__init__()
         self.hidden = hidden
         self.num_layers = NUM_GNN_LAYERS
@@ -43,18 +46,18 @@ class DualOutputEncoder(nn.Module):
         self.edge_types = edge_types
         self.use_gate = use_gate
 
-        # ---- 自适应门控阀 ----
-        # 门控在投影之前工作：原始特征维度 D = in_dims[ntype]
-        # X_struct 和 M 都是 D 维，struct_hint 是 8 维
-        ent_dim = in_dims.get("enterprise", hidden)
+        # ---- 自适应门控阀（每个节点类型独立） ----
         if use_gate:
-            self.gate = AdaptiveFeatureGate(
-                feature_dim=ent_dim,
-                struct_hint_dim=8,
-                hidden=64,
-            )
+            self.gates = nn.ModuleDict()
+            for ntype, dim in in_dims.items():
+                if dim is not None and dim > 0:
+                    self.gates[ntype] = AdaptiveFeatureGate(
+                        feature_dim=dim,
+                        struct_hint_dim=8,
+                        hidden=64,
+                    )
         else:
-            self.gate = None
+            self.gates = None
 
         # ---- 节点类型投影层 ----
         self.proj = nn.ModuleDict()
@@ -62,16 +65,13 @@ class DualOutputEncoder(nn.Module):
             if dim is not None:
                 self.proj[ntype] = Linear(dim, hidden)
 
-        # ---- 3 层异构卷积（每层动态匹配边类型） ----
+        # ---- 2 层 SAGE 卷积 ----
         self.convs = nn.ModuleList()
-        for i in range(NUM_GNN_LAYERS):
-            heads = num_heads if i < NUM_GNN_LAYERS - 1 else 1
+        for _ in range(NUM_GNN_LAYERS):
             conv_dict = {}
             for etype in edge_types:
-                conv_dict[etype] = GATConv(
-                    hidden, hidden // heads, heads=heads,
-                    dropout=dropout, add_self_loops=False
-                )
+                # 已投影到统一维度 hidden，直接显式传入，避免 lazy init
+                conv_dict[etype] = SAGEConv(hidden, hidden)
             self.convs.append(HeteroConv(conv_dict, aggr="mean"))
 
         # ---- 消息提取器 ----
@@ -90,26 +90,25 @@ class DualOutputEncoder(nn.Module):
               x_missing:    {ntype: (N, D)}  缺失指示（可选）
               struct_hint:  {ntype: (N, S)}  结构统计量（可选）
         输出:
-              h_v:   (N_ent, hidden * num_layers)  ← JK 拼接
-              m_v_r: {ename: (N_ent, hidden)}      ← 分关系消息
+              h_v:   (N_ent, hidden)          ← 仅最后一层
+              m_v_r: {ename: (N_ent, hidden)} ← 分关系消息
         """
-        # ---- 自适应门控阀（在投影前） ----
-        if self.gate is not None and x_struct is not None and x_missing is not None:
-            x_gated = {}
-            for ntype in x_dict:
-                if ntype in x_struct and ntype in x_missing:
-                    hint = struct_hint.get(ntype) if struct_hint else None
-                    if hint is None:
-                        hint = torch.zeros(x_dict[ntype].shape[0], 8, device=x_dict[ntype].device)
-                    x_gated[ntype] = self.gate(
-                        x_dict[ntype], x_missing[ntype], hint, x_struct[ntype]
-                    )
-                else:
-                    x_gated[ntype] = x_dict[ntype]
-        else:
-            x_gated = x_dict  # 无门控数据 → 直通
+        # ---- 1. 自适应门控阀（投影前） ----
+        x_gated = {}
+        for ntype, x in x_dict.items():
+            # 收集门控所需输入
+            m = x_missing.get(ntype) if x_missing else None
+            xs = x_struct.get(ntype) if x_struct else None
+            hint = struct_hint.get(ntype) if struct_hint else None
 
-        # ---- 投影到统一维度 ----
+            if self.use_gate and ntype in self.gates and m is not None and xs is not None:
+                if hint is None:
+                    hint = torch.zeros(x.shape[0], 8, device=x.device)
+                x_gated[ntype] = self.gates[ntype](x, m, hint, xs)
+            else:
+                x_gated[ntype] = x
+
+        # ---- 2. 投影到统一维度 ----
         h = {}
         for ntype in self.proj:
             if ntype in x_gated:
@@ -117,20 +116,18 @@ class DualOutputEncoder(nn.Module):
             else:
                 h[ntype] = self.proj[ntype](x_dict[ntype])
 
-        # ---- 3 层消息传递 ----
-        layer_outputs = []  # 存每层的 enterprise 输出
-        for i, conv in enumerate(self.convs):
+        # ---- 3. 2 层消息传递（不存中间层） ----
+        for conv in self.convs:
             h = conv(h, edge_index_dict)
             h = {k: self.dropout(F.relu(v)) for k, v in h.items()}
-            layer_outputs.append(h["enterprise"])
 
-        # ---- JK 连接 → 全局融合表示 ----
-        h_v = torch.cat(layer_outputs, dim=-1)  # (N_ent, hidden * 3)
+        # ---- 4. 最后一层 enterprise 表示 ----
+        h_v = h["enterprise"]  # (N_ent, hidden)
 
-        # ---- 提取分关系消息（从最后一层的 enterprise 输出） ----
+        # ---- 5. 分关系消息（.detach() 阻断反向图二次膨胀） ----
+        ent_detached = h_v.detach()
         m_v_r = {}
-        ent_out = layer_outputs[-1]  # (N_ent, hidden)
         for ename in self.msg_extractors:
-            m_v_r[ename] = self.msg_extractors[ename](ent_out)
+            m_v_r[ename] = self.msg_extractors[ename](ent_detached)
 
         return h_v, m_v_r

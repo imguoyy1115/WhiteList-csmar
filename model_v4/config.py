@@ -19,18 +19,27 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 模型超参数
 # ============================================================================
 HIDDEN_DIM = 128           # 隐藏层维度
-NUM_HEADS = 4              # GAT 注意力头数
+NUM_HEADS = 4              # GAT 注意力头数（SAGEConv 模式下不使用）
 DROPOUT = 0.3              # Dropout 概率
-NUM_GNN_LAYERS = 3         # 异构图卷积层数
+NUM_GNN_LAYERS = 2         # 异构图卷积层数
 
 # Γ 矩阵
-GAMMA_DIM = 6              # 关系类型数量
+GAMMA_DIM = 6              # 关系类型数量（实际由数据边类型数决定）
 GAMMA_LR = 0.01            # Γ 矩阵学习率（可单独设置）
 
 # 时序编码器
 SEQ_LEN = 12               # 输入历史窗口（月数）
-GRU_HIDDEN = 128           # GRU 隐藏维度
+GRU_HIDDEN = 64            # GRU 隐藏维度
 GRU_LAYERS = 2             # GRU 层数
+
+# 分类头
+NUM_CLASSES = 2            # 白名单: 二分类; 企业分级: 5 分类
+GRADE_CLASSES = 5          # S/A/B/C/D
+HEAD_BATCH_SIZE = 4096     # 分类头分批推理大小（防 OOM）
+
+# Mini-batch 训练（NeighborLoader）
+BATCH_SIZE = 512            # 每批目标节点数
+NUM_NEIGHBORS = [15, 10]    # 每层采样的邻居数（2层SAGE对应2个值）
 
 # 分类头
 NUM_CLASSES = 2            # 白名单: 二分类; 企业分级: 5 分类
@@ -44,12 +53,12 @@ DEVICE = "cuda"            # 自动检测
 EPOCHS = 300
 LR = 1e-3
 WEIGHT_DECAY = 5e-4
-EARLY_STOP_PATIENCE = 50
+EARLY_STOP_PATIENCE = 80   # 配合 LR 衰减，给足观察时间
 
 # 损失权重
 LAMBDA_RISK = 0.5          # 风险预测辅助损失
 LAMBDA_GRADE = 0.3         # 企业分级辅助损失
-LAMBDA_CONTRAST = 0.1      # 对比学习辅助损失
+LAMBDA_CONTRAST = 0.0      # 对比学习辅助损失（关闭：与BCE重叠，干扰梯度）
 LAMBDA_DISTILL = 0.2       # 蒸馏损失（Layer 7 用）
 LAMBDA_GAMMA_REG = 0.01    # Γ 正则化系数
 

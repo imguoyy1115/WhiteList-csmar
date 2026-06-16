@@ -66,6 +66,9 @@ class HeteroGraphData:
     struct_hint: Optional[Dict[str, torch.Tensor]] = None
     # {"enterprise": (N_ent, S)} 图结构统计量（度、PageRank 等），供门控阀感知
 
+    # ---- 季度序列特征（v4.3 Temporal GRU） ----
+    x_seq: Optional[torch.Tensor] = None  # (N_ent, 4, DIM+1) Q1-Q4 特征 + has_feature_q 标记
+
 
     def to(self, device: str) -> "HeteroGraphData":
         """一键移到 GPU/CPU"""
@@ -87,6 +90,8 @@ class HeteroGraphData:
             self.x_missing = {k: v.to(device) for k, v in self.x_missing.items()}
         if self.struct_hint:
             self.struct_hint = {k: v.to(device) for k, v in self.struct_hint.items()}
+        if self.x_seq is not None:
+            self.x_seq = self.x_seq.to(device)
         return self
 
     def summary(self):
@@ -100,3 +105,40 @@ class HeteroGraphData:
             print(f"  {etype[0]} --{etype[1]}--> {etype[2]}: {ei.shape[1]} 条边")
         print(f"  白名单正样本: {(self.y_white==1).sum().item()}")
         print(f"  训练/验证/测试: {self.train_mask.sum().item()}/{self.val_mask.sum().item()}/{self.test_mask.sum().item()}")
+
+    def to_pyg_heterodata(self):
+        """
+        ==================================================================
+        转换为 PyG 的 HeteroData，供 NeighborLoader 做 mini-batch 采样用。
+        n_id 字段会保留每个 batch 中节点映射回全局 ID，用于索引 x_struct 等。
+        ==================================================================
+        """
+        from torch_geometric.data import HeteroData
+
+        d = HeteroData()
+        for ntype, x in self.x_dict.items():
+            d[ntype].x = x
+        for etype, ei in self.edge_index_dict.items():
+            d[etype].edge_index = ei
+
+        # 标签（放在 enterprise 上）
+        d["enterprise"].y_white = self.y_white
+        d["enterprise"].y_risk = self.y_risk
+        d["enterprise"].y_grade = self.y_grade
+        d["enterprise"].train_mask = self.train_mask
+        d["enterprise"].val_mask = self.val_mask
+        d["enterprise"].test_mask = self.test_mask
+
+        # 门控阀数据：作为节点属性挂载，NeighborLoader 会自动跟随采样
+        if self.x_struct:
+            for ntype, xs in self.x_struct.items():
+                d[ntype].x_struct = xs
+        if self.x_missing:
+            for ntype, xm in self.x_missing.items():
+                d[ntype].x_missing = xm
+        if self.struct_hint:
+            for ntype, sh in self.struct_hint.items():
+                d[ntype].struct_hint = sh
+
+        d.num_enterprises = self.num_enterprises
+        return d
