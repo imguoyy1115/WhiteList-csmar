@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from config import HYPER_HIDDEN, HYPER_LAYERS, DROPOUT
 
 
-def __scatter_mean(src: torch.Tensor, index: torch.Tensor,
+def _scatter_mean(src: torch.Tensor, index: torch.Tensor,
                   dim: int = 0, dim_size: int = None) -> torch.Tensor:
     """
     纯 PyTorch _scatter_mean —— 不依赖 torch_scatter。
