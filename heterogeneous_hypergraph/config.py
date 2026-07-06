@@ -84,7 +84,15 @@ LAMBDA_SPARSE = 0.01       # 新增：Γ 非对角线稀疏正则
 
 # ── 消融实验（默认全部关闭 = 完整模型） ──
 ABLATION_NO_GAMMA = False     # True = Γ 退化为 I（消融跨关系传播）
-ABLATION_NO_TEMPORAL = False  # True = 去掉 GRU 时序，退化为 MLP 投影
+ABLATION_NO_TEMPORAL = False      # True = 去掉 GRU 时序，退化为 MLP 投影
+ABLATION_NO_FEATURE_SPLIT = False # True = 恢复旧行为（两个通道吃相同 13 维特征）
+
+# ── 特征分工（v5.1：同构通道看关系，异构通道看财务） ──
+# 同构通道取 SCF(8) + 诉讼(2) = 10 维，排除财务特征以避免中小企业零值噪声
+STRUCT_FEATURE_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11]
+# 异构通道取营收增长率(8) + 资产周转率(9) = 2 维，聚焦经营表现
+FINANCIAL_FEATURE_INDICES = [8, 9]
+# col 12 为预留维度，暂归入同构通道（修改 STRUCT_FEATURE_INDICES 即可调整）
 
 # ============================================================================
 # 边类型定义（v5 扩展为 6 种）

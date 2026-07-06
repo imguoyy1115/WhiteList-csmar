@@ -39,23 +39,20 @@ from classifier import MultiTaskHeads
 class HyperHeteroModel(nn.Module):
     """
     ==========================================================================
-    v5 完整模型：超图异构双通道 + Γ 风险传播 + GRU 时序
+    v5.1 完整模型：超图异构双通道 + Γ 风险传播 + GRU 时序
 
     数据流：
       Enterprise 特征 (N, 13)
-        ├─→ FeatureGate → X_gated
-        ├─→ MultiViewHyperEncoder → h_struct (N, 128)
-        └─→ HeteroChannelEncoder  → h_feat   (N, 128)
-              ↓
-        FusionGate(h_struct, h_feat, hint) → h_fusion (N, 64)
-              ↓
-        Γ 跨关系风险传播 → h_risk (N, 128)
-              ↓
-        Concat[h_fusion, h_risk] → (N, 192)
-              ↓
-        TemporalEncoder(h_seq) → z_v (N, 64)
-              ↓
-        MultiTaskHeads → logit_white, logit_risk, logit_grade
+        ├─→ FeatureGate → X_gated (N, 13)
+        ├─→ 特征分流:
+        │     ├─→ col[0-7,10-11] → X_hyper (N, 10) → MultiViewHyperEncoder → h_struct
+        │     └─→ col[8,9] + 缺失替换 → X_fin (N, 2) → HeteroChannelEncoder → h_feat
+        │          (中小企业财务缺失 → fin_missing_emb)
+        ├─→ FusionGate(h_struct, h_feat, hint) → h_fusion (N, 64)
+        ├─→ Γ 跨关系风险传播 → h_risk (N, 128)
+        ├─→ Concat[h_fusion, h_risk] → (N, 192)
+        ├─→ TemporalEncoder(h_seq) → z_v (N, 64)
+        └─→ MultiTaskHeads → logit_white, logit_risk, logit_grade
     ==========================================================================
     """
 
@@ -64,21 +61,34 @@ class HyperHeteroModel(nn.Module):
 
         # ── 自适应门控阀 ──
         ent_dim = in_dims.get("enterprise", 13)
+
+        # v5.1 特征分工：同构通道看关系，异构通道看财务
+        if not _cfg.ABLATION_NO_FEATURE_SPLIT:
+            struct_dim = len(_cfg.STRUCT_FEATURE_INDICES)   # 10: SCF(8) + 诉讼(2)
+            fin_dim = len(_cfg.FINANCIAL_FEATURE_INDICES)    # 2: 营收增长率 + 资产周转率
+        else:
+            struct_dim = ent_dim   # 消融：恢复为统一 13 维
+            fin_dim = ent_dim
+
         self.feature_gate = AdaptiveFeatureGate(
             feature_dim=ent_dim,
             struct_hint_dim=8,
             hidden=64,
         )
 
+        # 财务缺失企业的可学习向量（替代填 0，仅特征分流模式下生效）
+        self.fin_missing_emb = nn.Parameter(torch.randn(fin_dim) * 0.01)
+
         # ── 同构通道：多视图超图 ──
         self.hyper_encoder = MultiViewHyperEncoder(
-            in_dim=ent_dim,
+            in_dim=struct_dim,
             hidden=HYPER_HIDDEN,
         )
 
-        # ── 异构通道：特征图 ──
+        # ── 异构通道：特征图（enterprise 只接收财务维度的特征） ──
+        hetero_in_dims = {**in_dims, "enterprise": fin_dim}
         self.hetero_encoder = HeteroChannelEncoder(
-            in_dims=in_dims,
+            in_dims=hetero_in_dims,
             edge_types=edge_types,
             hidden=HIDDEN_DIM,
         )
@@ -148,20 +158,41 @@ class HyperHeteroModel(nn.Module):
         else:
             x_gated_ent = x_ent
 
-        x_dict_gated = {**x_dict, "enterprise": x_gated_ent}
+        # ── 2. 特征分流（v5.1：同构通道看关系，异构通道看财务） ──
+        if not _cfg.ABLATION_NO_FEATURE_SPLIT:
+            # 同构通道：SCF(8) + 诉讼(2) = 10 维，排除财务特征
+            x_hyper = x_gated_ent[:, _cfg.STRUCT_FEATURE_INDICES]
+            # 异构通道：营收增长率 + 资产周转率 = 2 维，聚焦经营表现
+            x_fin_raw = x_gated_ent[:, _cfg.FINANCIAL_FEATURE_INDICES]
 
-        # ── 2. 同构通道：超图编码 ──
-        h_struct = self.hyper_encoder(x_gated_ent, hyperedges)  # (N_ent, 128)
+            # 中小企业财务缺失 → 替换为可学习向量（避免 0 值噪声）
+            if m_ent is not None:
+                m_fin = m_ent[:, _cfg.FINANCIAL_FEATURE_INDICES]
+                fin_all_missing = m_fin.all(dim=1)  # (N_ent,)
+            else:
+                fin_all_missing = torch.zeros(N_ent, dtype=torch.bool, device=device)
+            x_fin = x_fin_raw.clone()
+            if fin_all_missing.any():
+                x_fin[fin_all_missing] = self.fin_missing_emb.unsqueeze(0)
+        else:
+            # 消融模式：不拆分特征，两个通道吃相同输入
+            x_hyper = x_gated_ent
+            x_fin = x_gated_ent
 
-        # ── 3. 异构通道：特征图编码 ──
+        x_dict_gated = {**x_dict, "enterprise": x_fin}
+
+        # ── 3. 同构通道：超图编码 ──
+        h_struct = self.hyper_encoder(x_hyper, hyperedges)  # (N_ent, 128)
+
+        # ── 4. 异构通道：特征图编码 ──
         h_feat = self.hetero_encoder(x_dict_gated, edge_index_dict)  # (N_ent, 128)
         if h_feat is None:
             h_feat = torch.zeros(N_ent, HIDDEN_DIM, device=device)
 
-        # ── 4. 双通道融合 ──
+        # ── 5. 双通道融合 ──
         h_fusion = self.fusion_gate(h_struct, h_feat, struct_hint=hint_ent)  # (N_ent, 64)
 
-        # ── 5. Γ 跨关系风险传播 ──
+        # ── 6. Γ 跨关系风险传播 ──
         m_v_r = {}
         for ename in self.msg_extractors:
             m_v_r[ename] = self.msg_extractors[ename](h_fusion)
@@ -169,16 +200,16 @@ class HyperHeteroModel(nn.Module):
         s_v, h_risk, gamma = self.gamma_module(m_v_r, edge_index_dict, num_enterprises)
         # h_risk: (N_ent, 128)
 
-        # ── 6. 融合 → 时序 ──
+        # ── 7. 融合 → 时序 ──
         h_combined = torch.cat([h_fusion, h_risk], dim=-1)  # (N_ent, 192)
 
-        # ── 7. 时序编码 / 消融：MLP 投影 ──
+        # ── 8. 时序编码 / 消融：MLP 投影 ──
         if _cfg.ABLATION_NO_TEMPORAL:
             z_v = self.temporal(h_combined)            # MLP: (N_ent, 192) → (N_ent, 64)
         else:
             z_v = self.temporal(h_combined, x_seq=x_seq)  # GRU: (N_ent, 192) + x_seq → (N_ent, 64)
 
-        # ── 8. 预测头 ──
+        # ── 9. 预测头 ──
         logit_white, logit_risk, logit_grade = self.heads(z_v)
 
         return logit_white, logit_risk, logit_grade, gamma, h_fusion

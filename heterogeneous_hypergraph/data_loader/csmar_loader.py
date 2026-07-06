@@ -14,7 +14,7 @@ CSV 加载 + 实体发现逻辑内嵌（避免跨版本 import 冲突），
 Enterprise 特征从 25 维压缩到 13 维（财务指标移到特征节点）。
 ================================================================================
 """
-import os, sys
+import os, sys, time
 import numpy as np
 import pandas as pd
 import torch
@@ -26,7 +26,7 @@ from sklearn.model_selection import train_test_split
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_interface import HeteroGraphData
 
-CSMAR_DIR = "/content/WhiteList-csmar/csmar"
+CSMAR_DIR = r"D:\Users\imguoyyy\PycharmProjects\WhiteList\csmar"
 SEED = 42
 np.random.seed(SEED)
 
@@ -1209,7 +1209,7 @@ def load_csmar_data_v5():
 
 
 if __name__ == "__main__":
-    t0 = time.time()
     import time
+    t0 = time.time()
     data = load_csmar_data_v5()
     print(f"\nTotal: {time.time()-t0:.1f}s")
