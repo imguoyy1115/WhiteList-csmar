@@ -85,7 +85,7 @@ LAMBDA_SPARSE = 0.01       # 新增：Γ 非对角线稀疏正则
 # ── 消融实验（默认全部关闭 = 完整模型） ──
 ABLATION_NO_GAMMA = False     # True = Γ 退化为 I（消融跨关系传播）
 ABLATION_NO_TEMPORAL = False      # True = 去掉 GRU 时序，退化为 MLP 投影
-ABLATION_NO_FEATURE_SPLIT = False # True = 恢复旧行为（两个通道吃相同 13 维特征）
+ABLATION_NO_FEATURE_SPLIT = True  # True = 恢复旧行为（两个通道吃相同 13 维特征），默认旧方案
 
 # ── 特征分工（v5.1：同构通道看关系，异构通道看财务） ──
 # 同构通道取 SCF(8) + 诉讼(2) = 10 维，排除财务特征以避免中小企业零值噪声

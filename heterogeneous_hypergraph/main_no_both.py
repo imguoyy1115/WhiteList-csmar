@@ -30,7 +30,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-# ── 消融开关：同时关闭 Γ 和时序 ──
+# ── 消融开关：同时关闭 Γ 和时序（旧方案：特征混合输入） ──
 config.ABLATION_NO_GAMMA = True
 config.ABLATION_NO_TEMPORAL = True
 

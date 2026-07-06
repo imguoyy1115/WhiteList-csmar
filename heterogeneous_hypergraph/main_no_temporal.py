@@ -25,7 +25,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-# ── 消融开关：关闭时序编码 ──
+# ── 消融开关：关闭时序（旧方案：特征混合输入） ──
 config.ABLATION_NO_TEMPORAL = True
 
 from config import (

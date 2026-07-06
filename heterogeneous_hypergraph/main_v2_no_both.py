@@ -1,18 +1,23 @@
 """
 ================================================================================
-消融实验 A: 去掉 Γ 矩阵（跨关系风险传播）
+消融实验 v2-C: 新方案同时去掉 Γ + 时序（仅保留特征分工 + 双通道融合）
 ================================================================================
-对照 main.py 的三层架构，将 Γ 矩阵退化为 I（单位矩阵），
-测试跨关系风险传播是否对模型有真实贡献。
+对照 main_v2.py（新方案完整模型），同时关闭：
+  - Γ 跨关系风险传播（退化为 I）
+  - GRU 时序编码（替换为 MLP 投影）
 
-即: 去掉 Layer 3 (CrossRelationPropagation) 的跨关系迁移功能，
-    保留语义注意力融合。
+即: 特征分工 ON, Γ = I, GRU → MLP — 新方案的最简基线。
 
 用法:
   cd heterogeneous_hypergraph
-  python main_no_gamma.py
+  python main_v2_no_both.py
 
-对比: main.py (Test AUC 目标 0.7949)
+对比:
+  main_v2.py               (新方案全架构):        ？？？
+  main_v2_no_gamma.py      (新方案无 Γ):          ？？？
+  main_v2_no_temporal.py   (新方案无时序):         ？？？
+  main_v2_no_both.py       (新方案无 Γ + 无时序):  ？？？
+  main_no_both.py          (旧方案无 Γ + 无时序):  ？？？
 ================================================================================
 """
 
@@ -25,8 +30,10 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-# ── 消融开关：关闭 Γ（旧方案：特征混合输入） ──
+# ── 新方案：特征分工 + 同时关闭 Γ 和时序 ──
+config.ABLATION_NO_FEATURE_SPLIT = False
 config.ABLATION_NO_GAMMA = True
+config.ABLATION_NO_TEMPORAL = True
 
 from config import (
     SEED, DEVICE, OUTPUT_DIR, EDGE_TYPES,
@@ -39,7 +46,8 @@ torch.manual_seed(SEED)
 
 def main():
     print("=" * 60)
-    print("  消融实验: 去掉 Γ 矩阵（Γ = I，无跨关系传播）")
+    print("  消融实验 v2: 特征分工 + 同时去掉 Γ 矩阵 + 时序编码")
+    print("  (仅保留特征分工 + 超图异构双通道 + FusionGate + MLP)")
     print("=" * 60)
 
     # ── Step 1: 加载数据 ──
@@ -49,7 +57,7 @@ def main():
     print(f"  数据加载完成，总耗时 {time.time() - t0:.1f}s")
 
     # ── Step 2: 构建模型 ──
-    print("\n[Step 2] 构建模型（Γ = I，无跨关系传播）...")
+    print("\n[Step 2] 构建模型（特征分工 + Γ=I + MLP替代GRU）...")
     in_dims = {ntype: data.x_dict[ntype].shape[1] for ntype in data.x_dict}
 
     valid_edge_types = [et for et in EDGE_TYPES if et in data.edge_index_dict]
@@ -60,7 +68,7 @@ def main():
     model = HyperHeteroModel(in_dims=in_dims, edge_types=valid_edge_types)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params:,}")
-    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + GRU")
+    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + MLP(消融) (特征分工)")
 
     # ── Step 3: 训练 ──
     print(f"\n[Step 3] 训练...")
@@ -86,18 +94,23 @@ def main():
 
     # ── Step 6: 保存 ──
     print(f"\n[Step 6] 保存到 {OUTPUT_DIR}/ ...")
-    torch.save(model.state_dict(), f"{OUTPUT_DIR}/model_no_gamma.pt")
+    torch.save(model.state_dict(), f"{OUTPUT_DIR}/model_v2_no_both.pt")
     pd.DataFrame({
-        "experiment": ["no_gamma"],
+        "experiment": ["v2_no_both"],
         "test_auc": [test_auc],
         "test_acc": [test_acc],
         "precision_at_10": [test_prec10]
-    }).to_csv(f"{OUTPUT_DIR}/results_no_gamma.csv", index=False)
-    print(f"  [OK] model_no_gamma.pt  [OK] results_no_gamma.csv")
+    }).to_csv(f"{OUTPUT_DIR}/results_v2_no_both.csv", index=False)
+    print(f"  [OK] model_v2_no_both.pt  [OK] results_v2_no_both.csv")
 
     print("\n" + "=" * 60)
-    print(f"  消融完成。Test AUC (无Γ) = {test_auc:.4f}, Precision@10 = {test_prec10:.4f}")
-    print(f"  等待对照 main.py (含Γ) 的结果做差: Δ = AUC_main - AUC_nogamma")
+    print(f"  消融完成。Test AUC (特征分工 + 无Γ + 无时序) = {test_auc:.4f}")
+    print(f"  对照:")
+    print(f"    main_v2.py               (新方案全架构):        ？？？")
+    print(f"    main_v2_no_gamma.py      (新方案无 Γ):          ？？？")
+    print(f"    main_v2_no_temporal.py   (新方案无时序):         ？？？")
+    print(f"    main_v2_no_both.py       (新方案无 Γ + 无时序):  {test_auc:.4f}")
+    print(f"    main_no_both.py          (旧方案无 Γ + 无时序):  ？？？")
     print("=" * 60)
 
 
