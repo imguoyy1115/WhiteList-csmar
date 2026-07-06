@@ -36,23 +36,100 @@ from layers.layer4_temporal import TemporalEncoder
 from classifier import MultiTaskHeads
 
 
+class FinTemporalEncoder(nn.Module):
+    """
+    ==========================================================================
+    v5.2 财务特征时序编码器
+
+    小 GRU 在 2 维财务特征上做 4 步半年度序列建模，
+    替代原来融合后的大维度全局 GRU（后者被超图静态输出淹没）。
+
+    双路径:
+      路径A (GRU): x_seq 原始财务序列 → GRU(2→8→2) → fin_gru
+      路径B (MLP): x_fin_raw (FeatureGate 输出) → MLP(2→8→2) → fin_mlp
+      Gate:       has_fin_data ? fin_gru : fin_mlp
+                  (只有有时序数据的企业才信 GRU，中小企业走 MLP)
+
+    消融模式 (ablation=True): 仅路径B (MLP)，退化为静态财务特征投影
+    ==========================================================================
+    """
+    def __init__(self, fin_dim=2, gru_hidden=8, dropout=0.2, ablation=False):
+        super().__init__()
+        self.fin_dim = fin_dim
+        self.gru_hidden = gru_hidden
+        self.ablation = ablation
+
+        if not ablation:
+            self.gru = nn.GRU(
+                input_size=fin_dim,
+                hidden_size=gru_hidden,
+                num_layers=1,
+                batch_first=True,
+                dropout=0.0,
+            )
+            self.gru_proj = nn.Linear(gru_hidden, fin_dim)
+
+        # MLP（既作为 GRU 模式的 fallback，也作为消融模式的主路径）
+        self.mlp = nn.Sequential(
+            nn.Linear(fin_dim, gru_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden, fin_dim),
+        )
+
+    def forward(self, x_fin_seq, fin_all_missing, x_fin_raw):
+        """
+        x_fin_seq:       (N, 4, fin_dim)  4 个半年度财务指标原始序列
+        fin_all_missing: (N,)             完全缺失财务数据的企业（中小企业）
+        x_fin_raw:       (N, fin_dim)     FeatureGate 输出的静态财务特征
+        returns:         (N, fin_dim)     时序感知的财务特征
+        """
+        if self.ablation:
+            # 消融模式：仅 MLP 静态投影
+            return self.mlp(x_fin_raw)
+
+        N = x_fin_seq.shape[0]
+
+        # 路径A: GRU 时序编码
+        gru_out, _ = self.gru(x_fin_seq)          # (N, 4, gru_hidden)
+        fin_gru = self.gru_proj(gru_out[:, -1, :])  # (N, fin_dim)
+
+        # 路径B: MLP fallback（静态财务特征投影）
+        fin_mlp = self.mlp(x_fin_raw)              # (N, fin_dim)
+
+        # Gate: 有财务数据 → 信 GRU；无 → 信 MLP
+        has_data = (~fin_all_missing).float().unsqueeze(-1)  # (N, 1)
+        x_fin = has_data * fin_gru + (1.0 - has_data) * fin_mlp
+
+        return x_fin
+
+
 class HyperHeteroModel(nn.Module):
     """
     ==========================================================================
-    v5.1 完整模型：超图异构双通道 + Γ 风险传播 + GRU 时序
+    v5.2 完整模型：超图异构双通道 + Γ 风险传播 + 财务特征时序GRU
 
-    数据流：
+    数据流（新方案 / 特征分工 ON）:
       Enterprise 特征 (N, 13)
         ├─→ FeatureGate → X_gated (N, 13)
         ├─→ 特征分流:
         │     ├─→ col[0-7,10-11] → X_hyper (N, 10) → MultiViewHyperEncoder → h_struct
-        │     └─→ col[8,9] + 缺失替换 → X_fin (N, 2) → HeteroChannelEncoder → h_feat
-        │          (中小企业财务缺失 → fin_missing_emb)
+        │     └─→ col[8,9] → X_fin_raw (N, 2)
+        │           └─→ FinTemporalEncoder(x_seq财务序列 + X_fin_raw) → X_fin (N, 2)
+        │               (小GRU捕捉营收/资产半年度波动，替代全局GRU)
+        ├─→ HeteroChannelEncoder(X_fin) → h_feat
         ├─→ FusionGate(h_struct, h_feat, hint) → h_fusion (N, 64)
         ├─→ Γ 跨关系风险传播 → h_risk (N, 128)
         ├─→ Concat[h_fusion, h_risk] → (N, 192)
-        ├─→ TemporalEncoder(h_seq) → z_v (N, 64)
+        ├─→ PostProj(MLP) → z_v (N, 64)    ← 时序已在财务层面完成，此处仅做维度投影
         └─→ MultiTaskHeads → logit_white, logit_risk, logit_grade
+
+    数据流（旧方案 / 特征分工 OFF，兼容）:
+      Enterprise 特征 (N, 13)
+        ├─→ FeatureGate → X_gated (N, 13)
+        ├─→ 两通道共享 X_gated
+        ├─→ FusionGate → h_fusion → Γ → Concat
+        └─→ TemporalEncoder(GRU/MLP) → z_v    ← 旧全局时序编码器
     ==========================================================================
     """
 
@@ -112,18 +189,38 @@ class HyperHeteroModel(nn.Module):
             risk_edge_names=risk_edge_names,
             ablation=_cfg.ABLATION_NO_GAMMA)
 
-        # ── 时序编码器 / 消融：MLP 投影 ──
-        self.fusion_dim = FUSION_HIDDEN + HIDDEN_DIM  # h_fusion(64) + h_risk(128) = 192
-        if _cfg.ABLATION_NO_TEMPORAL:
-            # 消融：用简单 MLP 替代 GRU 时序编码
-            self.temporal = nn.Sequential(
-                nn.Linear(self.fusion_dim, 64),
+        # ── 时序 / 投影（v5.2：新旧方案双路径） ──
+        self.fusion_dim_val = FUSION_HIDDEN + HIDDEN_DIM  # 64 + 128 = 192
+
+        if not _cfg.ABLATION_NO_FEATURE_SPLIT:
+            # ── 新方案：财务特征时序编码（v5.2） ──
+            self.fin_temporal = FinTemporalEncoder(
+                fin_dim=fin_dim,
+                gru_hidden=8,
+                dropout=DROPOUT,
+                ablation=_cfg.ABLATION_NO_TEMPORAL,
+            )
+            # 融合后仅做简单 MLP 投影（时序已在财务特征层面完成）
+            self.post_proj = nn.Sequential(
+                nn.Linear(self.fusion_dim_val, 64),
                 nn.ReLU(),
                 nn.Dropout(DROPOUT),
                 nn.Linear(64, 64),
             )
+            self.temporal = None  # 旧全局时序编码器不使用
         else:
-            self.temporal = TemporalEncoder(input_dim=None)
+            # ── 旧方案：全局时序编码器（保持不变） ──
+            self.fin_temporal = None
+            self.post_proj = None
+            if _cfg.ABLATION_NO_TEMPORAL:
+                self.temporal = nn.Sequential(
+                    nn.Linear(self.fusion_dim_val, 64),
+                    nn.ReLU(),
+                    nn.Dropout(DROPOUT),
+                    nn.Linear(64, 64),
+                )
+            else:
+                self.temporal = TemporalEncoder(input_dim=None)
 
         # ── 预测头 ──
         self.heads = MultiTaskHeads(in_dim=64)  # 两种路径都输出 64 维
@@ -158,22 +255,30 @@ class HyperHeteroModel(nn.Module):
         else:
             x_gated_ent = x_ent
 
-        # ── 2. 特征分流（v5.1：同构通道看关系，异构通道看财务） ──
+        # ── 2. 特征分流（v5.2：同构通道看关系，异构通道看财务 + 时序GRU） ──
         if not _cfg.ABLATION_NO_FEATURE_SPLIT:
             # 同构通道：SCF(8) + 诉讼(2) = 10 维，排除财务特征
             x_hyper = x_gated_ent[:, _cfg.STRUCT_FEATURE_INDICES]
             # 异构通道：营收增长率 + 资产周转率 = 2 维，聚焦经营表现
             x_fin_raw = x_gated_ent[:, _cfg.FINANCIAL_FEATURE_INDICES]
 
-            # 中小企业财务缺失 → 替换为可学习向量（避免 0 值噪声）
+            # 中小企业财务缺失 → 用于 Gate 选择 MLP fallback
             if m_ent is not None:
                 m_fin = m_ent[:, _cfg.FINANCIAL_FEATURE_INDICES]
                 fin_all_missing = m_fin.all(dim=1)  # (N_ent,)
             else:
                 fin_all_missing = torch.zeros(N_ent, dtype=torch.bool, device=device)
-            x_fin = x_fin_raw.clone()
-            if fin_all_missing.any():
-                x_fin[fin_all_missing] = self.fin_missing_emb.unsqueeze(0)
+
+            # v5.2 财务特征时序编码（小GRU在2维财务序列上，替代全局GRU）
+            if self.fin_temporal is not None and x_seq is not None:
+                # 从 x_seq 提取对应财务指标的 4 步序列 (N, 4, fin_dim)
+                x_fin_seq = x_seq[:, :, _cfg.FIN_SEQ_INDICES]
+                x_fin = self.fin_temporal(x_fin_seq, fin_all_missing, x_fin_raw)
+            else:
+                # Fallback: 无 x_seq 时用 FeatureGate 输出 + 缺失嵌入
+                x_fin = x_fin_raw.clone()
+                if fin_all_missing.any():
+                    x_fin[fin_all_missing] = self.fin_missing_emb.unsqueeze(0)
         else:
             # 消融模式：不拆分特征，两个通道吃相同输入
             x_hyper = x_gated_ent
@@ -203,11 +308,16 @@ class HyperHeteroModel(nn.Module):
         # ── 7. 融合 → 时序 ──
         h_combined = torch.cat([h_fusion, h_risk], dim=-1)  # (N_ent, 192)
 
-        # ── 8. 时序编码 / 消融：MLP 投影 ──
-        if _cfg.ABLATION_NO_TEMPORAL:
-            z_v = self.temporal(h_combined)            # MLP: (N_ent, 192) → (N_ent, 64)
+        # ── 8. 时序 / 投影（v5.2：新旧方案分叉） ──
+        if not _cfg.ABLATION_NO_FEATURE_SPLIT:
+            # 新方案：时序已在财务特征层面完成，此处仅 MLP 维度投影
+            z_v = self.post_proj(h_combined)            # MLP: (N_ent, 192) → (N_ent, 64)
         else:
-            z_v = self.temporal(h_combined, x_seq=x_seq)  # GRU: (N_ent, 192) + x_seq → (N_ent, 64)
+            # 旧方案：全局时序编码器
+            if _cfg.ABLATION_NO_TEMPORAL:
+                z_v = self.temporal(h_combined)         # MLP: (N_ent, 192) → (N_ent, 64)
+            else:
+                z_v = self.temporal(h_combined, x_seq=x_seq)  # GRU: + x_seq
 
         # ── 9. 预测头 ──
         logit_white, logit_risk, logit_grade = self.heads(z_v)
@@ -333,16 +443,23 @@ def train(model, data, epochs: int = EPOCHS):
     print(f"  AMP 混合精度: {'启用' if use_amp else '关闭'}")
 
     # ── 优化器 ──
-    optimizer = AdamW([
+    param_groups = [
         {"params": model.hyper_encoder.parameters(), "lr": LR_HYPER},
         {"params": model.hetero_encoder.parameters(), "lr": LR},
         {"params": model.fusion_gate.parameters(), "lr": LR},
         {"params": model.feature_gate.parameters(), "lr": LR},
         {"params": model.gamma_module.parameters(), "lr": LR * 0.1},
-        {"params": model.temporal.parameters(), "lr": LR},
         {"params": model.heads.parameters(), "lr": LR},
         {"params": model.msg_extractors.parameters(), "lr": LR},
-    ], lr=LR, weight_decay=WEIGHT_DECAY)
+        {"params": [model.fin_missing_emb], "lr": LR},
+    ]
+    if model.temporal is not None:
+        param_groups.append({"params": model.temporal.parameters(), "lr": LR})
+    if model.fin_temporal is not None:
+        param_groups.append({"params": model.fin_temporal.parameters(), "lr": LR})
+    if model.post_proj is not None:
+        param_groups.append({"params": model.post_proj.parameters(), "lr": LR})
+    optimizer = AdamW(param_groups, lr=LR, weight_decay=WEIGHT_DECAY)
 
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
                                    patience=15, min_lr=1e-6)

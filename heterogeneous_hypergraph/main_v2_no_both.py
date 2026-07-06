@@ -1,12 +1,12 @@
 """
 ================================================================================
-消融实验 v2-C: 新方案同时去掉 Γ + 时序（仅保留特征分工 + 双通道融合）
+消融实验 v2-C: 新方案同时去掉 Γ + 财务时序GRU（仅保留特征分工 + 双通道融合）
 ================================================================================
 对照 main_v2.py（新方案完整模型），同时关闭：
   - Γ 跨关系风险传播（退化为 I）
-  - GRU 时序编码（替换为 MLP 投影）
+  - FinGRU 财务时序编码（替换为 FinMLP 静态投影）
 
-即: 特征分工 ON, Γ = I, GRU → MLP — 新方案的最简基线。
+即: 特征分工 ON, Γ = I, FinGRU → FinMLP — 新方案的最简基线。
 
 用法:
   cd heterogeneous_hypergraph
@@ -46,7 +46,7 @@ torch.manual_seed(SEED)
 
 def main():
     print("=" * 60)
-    print("  消融实验 v2: 特征分工 + 同时去掉 Γ 矩阵 + 时序编码")
+    print("  消融实验 v2: 特征分工 + FinMLP(无时序) + Γ=I(无跨关系传播)")
     print("  (仅保留特征分工 + 超图异构双通道 + FusionGate + MLP)")
     print("=" * 60)
 
@@ -68,7 +68,7 @@ def main():
     model = HyperHeteroModel(in_dims=in_dims, edge_types=valid_edge_types)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params:,}")
-    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + MLP(消融) (特征分工)")
+    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + FinMLP(消融) (特征分工)")
 
     # ── Step 3: 训练 ──
     print(f"\n[Step 3] 训练...")

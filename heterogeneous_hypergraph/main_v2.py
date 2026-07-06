@@ -1,17 +1,19 @@
 """
 ================================================================================
-新方案 v5.1: 特征分工 + Γ 矩阵 + GRU 时序（完整模型）
+新方案 v5.2: 特征分工 + 财务时序GRU + Γ 矩阵（完整模型）
 ================================================================================
-对照 main.py（旧方案：两通道混合特征），本脚本使用特征分工：
-  - 同构通道: SCF(8) + 诉讼(2) = 10 维（排除财务特征）
-  - 异构通道: 营收增长率 + 资产周转率 = 2 维（聚焦经营表现）
-  - 中小企业财务缺失 → 可学习向量替代 0 值
+对照 main.py（旧方案：两通道混合特征 + 全局GRU），本脚本使用：
+
+  - 特征分工: 同构通道(SCF+诉讼=10维) / 异构通道(营收+资产=2维)
+  - 财务时序: 小GRU(2→8→2)在 4 步半年度财务序列上建模
+    (替代旧方案融合后的全局GRU，避免被超图静态输出淹没)
+  - 中小企业财务缺失 → fin_missing_emb + MLP fallback
 
 用法:
   cd heterogeneous_hypergraph
   python main_v2.py
 
-对比: main.py (旧方案, 特征混合输入)
+对比: main.py (旧方案, 特征混合 + 全局GRU)
 ================================================================================
 """
 
@@ -40,7 +42,7 @@ torch.manual_seed(SEED)
 
 def main():
     print("=" * 60)
-    print("  新方案 v5.1: 特征分工 + Γ + GRU（完整模型）")
+    print("  新方案 v5.2: 特征分工 + 财务时序GRU + Γ（完整模型）")
     print("=" * 60)
 
     # ── Step 1: 加载数据 ──
@@ -64,7 +66,7 @@ def main():
     print(f"  节点类型: {list(in_dims.keys())}")
     print(f"  边类型: {[et[1] for et in valid_edge_types]}")
     print(f"  超图视图: {list(data.hyperedges.keys())}")
-    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ + GRU (特征分工)")
+    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ + FinGRU(fin_dim→8→fin_dim) (特征分工)")
 
     # ── Step 3: 训练 ──
     print(f"\n[Step 3] 训练...")

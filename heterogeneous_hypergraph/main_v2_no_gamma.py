@@ -1,11 +1,11 @@
 """
 ================================================================================
-消融实验 v2-A: 新方案去掉 Γ 矩阵（特征分工 + 无跨关系传播 + GRU）
+消融实验 v2-A: 新方案去掉 Γ 矩阵（特征分工 + FinGRU + Γ=I）
 ================================================================================
 对照 main_v2.py（新方案完整模型），将 Γ 矩阵退化为 I（单位矩阵），
-测试在特征分工架构下，跨关系风险传播是否仍有贡献。
+测试在特征分工 + 财务时序GRU架构下，跨关系风险传播是否仍有贡献。
 
-即: 特征分工 ON, Γ = I, GRU ON
+即: 特征分工 ON, FinGRU ON, Γ = I
 
 用法:
   cd heterogeneous_hypergraph
@@ -42,7 +42,7 @@ torch.manual_seed(SEED)
 
 def main():
     print("=" * 60)
-    print("  消融实验 v2: 特征分工 + 去掉 Γ 矩阵（Γ = I）")
+    print("  消融实验 v2: 特征分工 + FinGRU + Γ=I")
     print("=" * 60)
 
     # ── Step 1: 加载数据 ──
@@ -63,7 +63,7 @@ def main():
     model = HyperHeteroModel(in_dims=in_dims, edge_types=valid_edge_types)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params:,}")
-    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + GRU (特征分工)")
+    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ=I(消融) + FinGRU (特征分工)")
 
     # ── Step 3: 训练 ──
     print(f"\n[Step 3] 训练...")

@@ -1,19 +1,19 @@
 """
 ================================================================================
-消融实验 v2-B: 新方案去掉时序编码（特征分工 + Γ + MLP）
+消融实验 v2-B: 新方案去掉财务时序GRU（特征分工 + Γ + 财务MLP）
 ================================================================================
-对照 main_v2.py（新方案完整模型），将 GRU 时序编码替换为简单 MLP 投影，
-测试在特征分工架构下，半年报时序数据是否仍有贡献。
+对照 main_v2.py（新方案完整模型），将财务特征的小 GRU 替换为 MLP 投影，
+测试在特征分工架构下，财务半年度时序GRU是否仍有贡献。
 
-即: 特征分工 ON, Γ ON, GRU → MLP
+即: 特征分工 ON, Γ ON, FinGRU → FinMLP（财务特征静态投影）
 
 用法:
   cd heterogeneous_hypergraph
   python main_v2_no_temporal.py
 
 对比:
-  main_v2.py               (新方案全架构):     ？？？
-  main_no_temporal.py      (旧方案无时序):     ？？？
+  main_v2.py               (新方案全架构):         ？？？
+  main_no_temporal.py      (旧方案无时序):         ？？？
 ================================================================================
 """
 
@@ -42,7 +42,7 @@ torch.manual_seed(SEED)
 
 def main():
     print("=" * 60)
-    print("  消融实验 v2: 特征分工 + 去掉时序编码（GRU → MLP）")
+    print("  消融实验 v2: 特征分工 + 去掉财务时序GRU（FinGRU → FinMLP）")
     print("=" * 60)
 
     # ── Step 1: 加载数据 ──
@@ -52,7 +52,7 @@ def main():
     print(f"  数据加载完成，总耗时 {time.time() - t0:.1f}s")
 
     # ── Step 2: 构建模型 ──
-    print("\n[Step 2] 构建模型（特征分工 + Γ + MLP替代GRU）...")
+    print("\n[Step 2] 构建模型（特征分工 + FinMLP(消融) + Γ）...")
     in_dims = {ntype: data.x_dict[ntype].shape[1] for ntype in data.x_dict}
 
     valid_edge_types = [et for et in EDGE_TYPES if et in data.edge_index_dict]
@@ -63,7 +63,7 @@ def main():
     model = HyperHeteroModel(in_dims=in_dims, edge_types=valid_edge_types)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  总参数量: {total_params:,}")
-    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ + MLP(消融) (特征分工)")
+    print(f"  架构: 超图4视图 + 异构{len(in_dims)}节点{len(valid_edge_types)}边 + FusionGate + Γ + FinMLP(消融) (特征分工)")
 
     # ── Step 3: 训练 ──
     print(f"\n[Step 3] 训练...")
