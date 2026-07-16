@@ -26,7 +26,7 @@ from sklearn.model_selection import train_test_split
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data_interface import HeteroGraphData
 
-CSMAR_DIR = "/content/WhiteList-csmar/csmar"
+CSMAR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "csmar-7.16")
 SEED = 42
 np.random.seed(SEED)
 
@@ -74,20 +74,20 @@ def ent_id(code_or_name, E):
 def load_all():
     print("[1/5] Loading CSVs...")
     T = {}
-    T["solvency"]   = _read("偿债能力164658534","FI_T1.csv")
-    T["profit"]     = _read("盈利能力164846481","FI_T5.csv")
-    T["operation"]  = _read("经营能力165028388","FI_T4.csv")
-    T["growth"]     = _read("发展能力165246963","FI_T8.csv")
-    T["cashflow"]   = _read("现金流分析165410036","FI_T6.csv")
-    T["risklevel"]  = _read("风险水平165544812","FI_T7.csv")
-    T["shareholder"]= _read("十大股东文件170142830","HLD_Shareholders.csv")
-    T["controller"] = _read("上市公司控制人文件170232148","HLD_Contrshr.csv")
-    T["lawsuit"]    = _read("诉讼仲裁明细表170517712","LA_DETAIL.csv")
-    T["scf_ov"]     = _read("供应链金融总体情况表163329193","SCF_Overview.csv")
-    T["scf_stats"]  = _read("供应链金融业务统计表163124673","SCF_BusinessStats.csv")
-    T["scf_credit"] = _read("商业信用及话语权表162729271","SCF_TradeCreditPower.csv")
-    T["scf_ar"]     = _read("应收账款主要欠款人信息表161752742","SCF_ARMajorDebtors.csv")
-    T["scf_ap"]     = _read("预付账款主要欠款人信息表162411085","SCF_APMajorCreditors.csv")
+    T["solvency"]   = _read("偿债能力133357457","FI_T1.csv")
+    T["profit"]     = _read("盈利能力134632506","FI_T5.csv")
+    T["operation"]  = _read("经营能力135259886","FI_T4.csv")
+    T["growth"]     = _read("发展能力135640386","FI_T8.csv")
+    T["cashflow"]   = _read("现金流分析140224916","FI_T6.csv")
+    T["risklevel"]  = _read("风险水平140608073","FI_T7.csv")
+    T["shareholder"]= _read("十大股东文件144239277","HLD_Shareholders.csv")
+    T["controller"] = _read("上市公司控制人文件144846229","HLD_Contrshr.csv")
+    T["lawsuit"]    = _read("诉讼仲裁明细表145241458","LA_DETAIL.csv")
+    T["scf_ov"]     = _read("供应链金融总体情况表143535774","SCF_Overview.csv")
+    # T["scf_stats"]  = _read("供应链金融业务统计表163124673","SCF_BusinessStats.csv")  # 未下载
+    T["scf_credit"] = _read("商业信用及话语权表141420435","SCF_TradeCreditPower.csv")
+    T["scf_ar"]     = _read("应收账款主要欠款人信息表142009823","SCF_ARMajorDebtors.csv")
+    T["scf_ap"]     = _read("预付账款主要欠款人信息表143057203","SCF_APMajorCreditors.csv")
     for k,v in T.items(): print(f"  {k}: {len(v)} rows")
     return T
 
@@ -129,7 +129,7 @@ def build_entities(T):
 
     name2code = {}
     pairs = [("scf_ov","Symbol","ShortName"),("scf_credit","Symbol","ShortName"),
-             ("shareholder","Stkcd","S0301a"),("controller","Stkcd","S0701a")]
+             ("shareholder","Stkcd","S0301a"),("controller","Stkcd","S0701b")]  # 2026-07-16 修正：S0701a(依据代码)→S0701b(实际控制人名称)
     for dfk, code_col, name_col in pairs:
         df = T[dfk]
         if code_col not in df.columns or name_col not in df.columns:
@@ -265,10 +265,10 @@ def build_features_v5(T, E):
 
     # ── 3.1 财务指标：不再填入 X_ent，改为构建 financial_records ──
     fin_map = {
-        "solvency": {"F010101A": "CR", "F010701B": "DAR", "F011201A": "ICR"},
-        "profit":    {"F050201B": "ROA", "F050501B": "ROE"},
-        "operation": {"F040201B": "ART", "F040801B": "APT"},
-        "growth":    {"F080601A": "TAGR", "F081601B": "REVGR"},
+        "solvency": {"F010101A": "CR", "F011201A": "DAR", "F010701B": "ICR"},  # 2026-07-16 修正：F011201A=资产负债率, F010701B=利息保障倍数
+        "profit":    {"F050202B": "ROA", "F050502B": "ROE"},                    # 2026-07-16 修正：新下载数据F编码01→02
+        "operation": {"F040202B": "ART", "F040802B": "APT"},                    # 2026-07-16 修正：新下载数据F编码01→02
+        "growth":    {"F080601A": "TAGR", "F081602C": "REVGR"},                 # 2026-07-16 修正：REVGR编码F081601B→F081602C
         "cashflow":  {"F060101B": "CFONI"},
         "risklevel": {"F070101B": "DFL", "F070201B": "DOL"},
     }
@@ -521,11 +521,9 @@ def build_edges_v5(T, E, fin_nodes):
     # ── 4.2 equity（复用 v4 逻辑） ──
     eq_set = set()
     df_sh = T["shareholder"]
-    LIMIT = 200000
-    if len(df_sh) > LIMIT:
-        df_sh = df_sh.sample(LIMIT, random_state=SEED)
+    # 2026-07-16: 新数据已裁剪到2024-2025（16.9万行），无需采样
     dst = df_sh["Stkcd"].astype(str).apply(lambda x: ent_id(x, E)).values
-    ratio = pd.to_numeric(df_sh["S0306a"], errors="coerce").fillna(0).values
+    ratio = pd.to_numeric(df_sh["S0304a"], errors="coerce").fillna(0).values  # 2026-07-16 修正：S0306a(排名)→S0304a(持股比例%)
     names = df_sh["S0301a"].astype(str)
     for i in range(len(df_sh)):
         d, r = int(dst[i]), float(ratio[i])

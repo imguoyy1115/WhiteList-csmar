@@ -175,18 +175,30 @@ def train_xgboost(X_train, y_train, X_val, y_val):
     )
     elapsed = time.time() - t0
 
-    best_iter = getattr(model, "best_iteration", None) or XGB_PARAMS["n_estimators"]
-    print(f"  训练完成，耗时 {elapsed:.1f}s")
-    print(f"  最佳迭代: {best_iter}")
-    print(f"  最佳验证 AUC: {model.best_score:.4f}")
+    # ── 从 evals_result() 中提取真实的验证集 AUC 历史 ──
+    #     model.best_score / best_iteration 在某些 xgboost 版本中
+    #     报告的是最终 epoch 的值而非历史峰值，因此手动计算
+    evals = model.evals_result()
+    val_key = list(evals.keys())[0]  # "validation_0"
+    val_auc_history = evals[val_key]["auc"]
 
-    return model
+    best_idx = int(np.argmax(val_auc_history))  # 真正的最优迭代位置
+    best_val_auc = float(val_auc_history[best_idx])
+
+    print(f"  训练完成，耗时 {elapsed:.1f}s")
+    print(f"  总迭代数: {len(val_auc_history)}, 早停轮次: {early_stop}")
+    print(f"  最佳迭代: {best_idx + 1}  (总计 {len(val_auc_history)} 轮)")
+    print(f"  最佳验证 AUC: {best_val_auc:.4f}")
+    print(f"  最终验证 AUC: {val_auc_history[-1]:.4f} (最后 {early_stop} 轮未提升时触发早停)")
+
+    return model, best_val_auc, best_idx
 
 
 # ============================================================================
 # Step 3: 评估
 # ============================================================================
-def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_names):
+def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_names,
+             best_val_auc=None, best_idx=None):
     """二分类评估：AUC + Accuracy + F1 + Precision@10 + 特征重要性"""
     print(f"\n[Step 3] 评估...")
     print("=" * 60)
@@ -214,12 +226,13 @@ def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_name
     train_proba = model.predict_proba(X_train)[:, 1]
     val_proba = model.predict_proba(X_val)[:, 1]
     train_auc = roc_auc_score(y_train, train_proba)
-    val_auc = roc_auc_score(y_val, val_proba)
+    val_auc_current = roc_auc_score(y_val, val_proba)
     print(f"\n  ── 辅助诊断 ──")
-    print(f"  训练 AUC:  {train_auc:.4f}")
-    print(f"  验证 AUC:  {val_auc:.4f}")
-    print(f"  测试 AUC:  {test_auc:.4f}")
-    print(f"  Train-Test Gap: {train_auc - test_auc:.4f}")
+    print(f"  训练 AUC:           {train_auc:.4f}")
+    print(f"  验证 AUC (历史峰值): {best_val_auc:.4f}" if best_val_auc else f"  验证 AUC:           {val_auc_current:.4f}")
+    print(f"  验证 AUC (最终模型): {val_auc_current:.4f}")
+    print(f"  测试 AUC:           {test_auc:.4f}")
+    print(f"  Train-Test Gap:     {train_auc - test_auc:.4f}")
 
     # ── 混淆矩阵 ──
     print(f"\n  ── 混淆矩阵 ──")
@@ -245,8 +258,9 @@ def evaluate(model, X_train, y_train, X_val, y_val, X_test, y_test, feature_name
         "Test_F1": test_f1,
         "Precision_at_10": test_prec10,
         "Train_AUC": train_auc,
-        "Val_AUC": val_auc,
-        "Best_Iteration": model.best_iteration,
+        "Val_AUC_Best_History": best_val_auc if best_val_auc else val_auc_current,
+        "Val_AUC_Current": val_auc_current,
+        "Best_Iteration": best_idx + 1 if best_idx is not None else None,
         "Train_Pos_Ratio": y_train.mean(),
         "Test_Pos_Ratio": y_test.mean(),
     }
@@ -305,11 +319,12 @@ if __name__ == "__main__":
     y_test = y[test_mask]
 
     # ── Step 3: 训练 ──
-    model = train_xgboost(X_train, y_train, X_val, y_val)
+    model, best_val_auc, best_idx = train_xgboost(X_train, y_train, X_val, y_val)
 
     # ── Step 4: 评估 ──
     results, y_pred_proba = evaluate(
-        model, X_train, y_train, X_val, y_val, X_test, y_test, feature_names
+        model, X_train, y_train, X_val, y_val, X_test, y_test, feature_names,
+        best_val_auc=best_val_auc, best_idx=best_idx,
     )
 
     # ── Step 5: 保存 ──
@@ -322,7 +337,7 @@ if __name__ == "__main__":
     print("  GNN (v5.2) vs XGBoost 对比")
     print("=" * 60)
     print(f"              Test AUC    Val AUC")
-    print(f"  XGBoost     {results['Test_AUC']:.4f}      {results['Val_AUC']:.4f}   (纯表格 13维，无图)")
+    print(f"  XGBoost     {results['Test_AUC']:.4f}      {results['Val_AUC_Best_History']:.4f}   (纯表格 13维，无图)")
     print(f"  GNN v5.2    0.8086      0.7872   (main_v2_no_temporal, 特征分工 + FinMLP + Γ)")
     print(f"  GNN v5.2    0.8074      0.7875   (main_v2, 特征分工 + FinGRU + Γ)")
     print(f"  ─────────────────────────────────")
